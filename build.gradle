@@ -1,0 +1,176 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import com.github.jengelman.gradle.plugins.shadow.transformers.Log4j2PluginsCacheFileTransformer
+import com.github.jengelman.gradle.plugins.shadow.transformers.PropertiesFileTransformer
+
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+group 'org.example'
+version '1.0.0'
+repositories {
+    mavenCentral()
+    gradlePluginPortal()
+    maven {
+        url "https://maven.seedfinding.com"
+        }
+
+    maven {
+        url "https://maven.latticg.com"
+        }
+
+    maven {
+
+        url "https://jitpack.io"
+
+        }
+    maven {url "https://repo.jellejurre.dev"}
+
+}
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+test {
+    useJUnitPlatform()
+}
+
+def mainClassName = 'com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderFrame'
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+// 普通 jar 与 shadowJar 都输出 FlowerFarmFinder-1.0.0.jar，必须都带入口类，
+// 否则后执行的任务会盖掉带 Main-Class 的包。
+jar {
+    archiveBaseName.set('FlowerFarmFinder')
+    manifest {
+        attributes 'Main-Class': mainClassName
+        attributes 'Multi-Release': 'true'
+    }
+}
+
+// 配置 Shadow JAR
+shadowJar {
+    archiveBaseName.set('FlowerFarmFinder')
+    archiveClassifier.set('')
+    mergeServiceFiles()
+    manifest {
+        attributes 'Main-Class': mainClassName
+        attributes 'Multi-Release': 'true'
+    }
+}
+
+// 创建 FlowerFarmFinder 的可执行 JAR
+tasks.register('buildMainJar', ShadowJar) {
+    group = 'build'
+    description = 'Creates a fat JAR for FlowerFarmFinder'
+    archiveBaseName.set('FlowerFarmFinder')
+    archiveClassifier.set('')
+    from sourceSets.main.output
+    configurations = [project.configurations.runtimeClasspath]
+    manifest {
+        attributes 'Main-Class': mainClassName
+        attributes 'Multi-Release': 'true'
+    }
+    mergeServiceFiles()
+    transform(Log4j2PluginsCacheFileTransformer)
+    transform(PropertiesFileTransformer) {
+        paths = ['META-INF/spring.handlers', 'META-INF/spring.schemas']
+        mergeStrategy = "append"
+    }
+    // 注意：不要排除 META-INF/versions/**，因为 Multi-Release JAR 需要这些文件
+    exclude 'module-info.class'
+}
+
+// 创建所有 JAR 的任务
+tasks.register('buildAllJars') {
+    group = 'build'
+    description = 'Builds all executable JARs'
+    dependsOn buildMainJar
+}
+
+// Prebuilt native libraries: buildMainJar triggers Windows JNI build when possible.
+def generatedNativeResourcesDir = layout.buildDirectory.dir('generated/native-resources')
+def windowsDll = file('native/windows/libFlowerFarmFinderLibJ.dll')
+def jniBat = file('jni/build-jni.bat')
+
+tasks.register('buildNativeWindows', Exec) {
+    group = 'build'
+    description = 'Builds libFlowerFarmFinderLibJ.dll via jni/build-jni.bat'
+    workingDir = file('jni')
+    commandLine 'cmd', '/c', 'build-jni.bat'
+    def runningJavaHome = System.getProperty('java.home')
+    if (file("${runningJavaHome}/include/jni.h").exists()) {
+        environment 'JAVA_HOME', runningJavaHome
+    }
+    onlyIf {
+        System.getProperty('os.name').toLowerCase().contains('windows') && jniBat.exists()
+    }
+    inputs.files(
+        fileTree('jni') {
+            include 'FlowerFarmSearch.cpp', 'FlowerFarmSearch.h',
+                    'build-jni.bat',
+                    'cts/*.{c,h}',
+                    'cxx_compat/*.h',
+                    'native/jni/**/*.cpp', 'native/jni/**/*.h',
+                    'cubiomes/generator.{c,h}', 'cubiomes/layers.{c,h}',
+                    'cubiomes/biomenoise.{c,h}', 'cubiomes/biomes.{c,h}',
+                    'cubiomes/noise.{c,h}', 'cubiomes/util.{c,h}',
+                    'cubiomes/rng.h', 'cubiomes/xrms.h', 'cubiomes/tables/*.h'
+        }
+    )
+    outputs.file(windowsDll)
+}
+
+tasks.register('prepareNativeResources') {
+    group = 'build'
+    description = 'Collects prebuilt dll/so/dylib from native/ into jar resources'
+    dependsOn tasks.named('buildNativeWindows')
+    inputs.files(windowsDll)
+    outputs.dir(generatedNativeResourcesDir)
+    doLast {
+        def outDir = generatedNativeResourcesDir.get().asFile
+        delete(outDir)
+        outDir.mkdirs()
+
+        def windowsDir = file('native/windows')
+        def linuxDir = file('native/linux')
+        def macosDir = file('native/macos')
+
+        if (!windowsDll.exists()) {
+            throw new GradleException(
+                'Missing native/windows/libFlowerFarmFinderLibJ.dll. ' +
+                'Run jni/build-jni.bat (uses jni/cubiomes).')
+        }
+
+        copy {
+            from(windowsDir)
+            include('*.dll')
+            into(new File(outDir, 'native/windows'))
+        }
+        if (linuxDir.exists()) {
+            copy {
+                from(linuxDir)
+                include('*.so')
+                into(new File(outDir, 'native/linux'))
+            }
+        }
+        if (macosDir.exists()) {
+            copy {
+                from(macosDir)
+                include('*.dylib')
+                into(new File(outDir, 'native/macos'))
+            }
+        }
+    }
+}
+
+tasks.named('processResources') {
+    dependsOn tasks.named('prepareNativeResources')
+    from(generatedNativeResourcesDir)
+}
+
+tasks.named('buildMainJar') {
+    dependsOn tasks.named('prepareNativeResources')
+}

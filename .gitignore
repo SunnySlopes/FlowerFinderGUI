@@ -1,0 +1,74 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+.kotlin/
+
+# Compiled Java
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+# Eclipse
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# VS Code
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs / JVM crash dumps
+*.log
+hs_err_pid*
+replay_pid*
+
+# Native / C++ build artifacts
+jni/build/
+jni/build-mingw/
+jni/native/jni/build/
+jni/**/*.o
+jni/**/*.a
+jni/**/*.obj
+jni/**/*.exe
+jni/**/*.dll
+jni/**/*.lib
+jni/**/*.pdb
+jni/**/*.ilk
+jni/**/*.exp
+jni/**/*.so
+jni/**/*.dylib
+
+# Prebuilt native libraries at repo root (produced by jni/build-jni.bat for Gradle JAR packaging)
+# Use leading slash so jni/native/ sources are still tracked.
+/native/
