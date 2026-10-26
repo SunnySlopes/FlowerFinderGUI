@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -26,15 +27,79 @@ constexpr int kNetherY = 64;
 constexpr int kPaleDist = 64;
 constexpr int kFlowerAreaMin = 2000;
 
-bool pauseOk(FlowerSearchControl &c)
+int stopRequested(void *user)
 {
-    while (c.pauseReq && c.pauseReq->load())
+    auto *c = static_cast<FlowerSearchControl *>(user);
+    return (c && c->stopReq && c->stopReq->load()) ? 1 : 0;
+}
+
+/* Blocks while paused; returns nonzero when the caller must abort. */
+int waitForPause(void *user)
+{
+    auto *c = static_cast<FlowerSearchControl *>(user);
+    if (!c)
+        return 0;
+    while (c->pauseReq && c->pauseReq->load())
     {
-        if (c.stopReq && c.stopReq->load())
-            return false;
+        if (c->stopReq && c->stopReq->load())
+            return 1;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    return !(c.stopReq && c.stopReq->load());
+    return (c->stopReq && c->stopReq->load()) ? 1 : 0;
+}
+
+bool pauseOk(FlowerSearchControl &c)
+{
+    return waitForPause(&c) == 0;
+}
+
+/* Binds the C engine to the C++ control object for the lifetime of a search. */
+struct CtsBinding {
+    explicit CtsBinding(FlowerSearchControl &c) : control(c)
+    {
+        cts_bind_control(&stopRequested, &waitForPause, &control);
+    }
+    ~CtsBinding()
+    {
+        cts_bind_control(nullptr, nullptr, nullptr);
+        cts_bind_progress(nullptr, nullptr);
+    }
+    FlowerSearchControl &control;
+};
+
+void storeInt(std::atomic_int *p, int value)
+{
+    if (p)
+        p->store(value);
+}
+
+int loadInt(std::atomic_int *p)
+{
+    return p ? p->load() : 0;
+}
+
+void setPhase(FlowerSearchControl &c, int phase, int total)
+{
+    storeInt(c.phase, phase);
+    storeInt(c.total, total);
+    storeInt(c.current, 0);
+    if (c.phaseTotal && c.phaseTotal != c.total)
+        storeInt(c.phaseTotal, total);
+    if (c.phaseCurrent && c.phaseCurrent != c.current)
+        storeInt(c.phaseCurrent, 0);
+}
+
+void setPhaseCurrent(FlowerSearchControl &c, int current)
+{
+    storeInt(c.current, current);
+    if (c.phaseCurrent && c.phaseCurrent != c.current)
+        storeInt(c.phaseCurrent, current);
+}
+
+void setOverall(FlowerSearchControl &c, int current, int total)
+{
+    storeInt(c.overallCurrent, current);
+    storeInt(c.overallTotal, total);
 }
 
 int alignDown(int value, int multiple, int minimum)
@@ -45,7 +110,8 @@ int alignDown(int value, int multiple, int minimum)
     return value >= minimum ? value : 0;
 }
 
-ScanCfg makeCfg(int windowX, int windowZ, int fullVerify, int noPale, int cluster)
+ScanCfg makeCfg(int windowX, int windowZ, int fullVerify, int noPale, int cluster,
+                int threads)
 {
     ScanCfg cfg{};
     cfg.e_lo = 0.05;
@@ -72,6 +138,9 @@ ScanCfg makeCfg(int windowX, int windowZ, int fullVerify, int noPale, int cluste
     cfg.pm_h = 0.02;
     cfg.full_verify = fullVerify ? 1 : 0;
     cfg.no_pale = noPale ? 1 : 0;
+    cfg.threads = threads > 0 ? threads : 1;
+    const unsigned hw = std::thread::hardware_concurrency();
+    cfg.max_threads = hw > 0 ? (int) hw : 1;
     return cfg;
 }
 
@@ -80,31 +149,13 @@ int64_t floorDiv8(int64_t v)
     return v >= 0 ? v / 8 : -((-v + 7) / 8);
 }
 
-struct OutRow {
+/* Internal row: public fields plus search-only ranking keys. */
+struct OutRow : FlowerRow {
     int score = 0;
     int hasPinkPetals = 0;
     int order = 0;
     int qx = 0;
     int qz = 0;
-    int winx = 0;
-    int winz = 0;
-    int cx = 0;
-    int cz = 0;
-    int nx = 0;
-    int nz = 0;
-    int paleX = 0;
-    int paleZ = 0;
-    int swampX = 0;
-    int swampZ = 0;
-    int flowerX = 0;
-    int flowerZ = 0;
-    int flowerY = 0;
-    int flowerArea = 0;
-    int paleArea = 0;
-    int swampArea = 0;
-    char orient = 0;
-    std::string bonus;
-    std::string nether;
 };
 
 /* GUI: 1.18~1.21.3 → MC_1_21_3; 1.21.4+ → newest. */
@@ -201,14 +252,18 @@ int64_t originDist2(const OutRow &r)
 }
 
 /** Prefer cherry grove; else closer to origin. Chebyshev cluster in blocks. */
-void clusterVerifiedRows(std::vector<OutRow> &rows, int clusterBlocks)
+bool clusterVerifiedRows(std::vector<OutRow> &rows, int clusterBlocks,
+                         FlowerSearchControl &control)
 {
     if (rows.size() <= 1 || clusterBlocks <= 0)
-        return;
+        return true;
     std::vector<OutRow> kept;
     kept.reserve(rows.size());
-    for (const OutRow &h : rows)
+    for (size_t n = 0; n < rows.size(); n++)
     {
+        if ((n & 63) == 0 && !pauseOk(control))
+            return false;
+        const OutRow &h = rows[n];
         int found = -1;
         for (size_t j = 0; j < kept.size(); j++)
         {
@@ -234,15 +289,16 @@ void clusterVerifiedRows(std::vector<OutRow> &rows, int clusterBlocks)
             kept[(size_t) found] = h;
     }
     rows.swap(kept);
+    return true;
 }
 
-std::string formatRow(const OutRow &h, const VersionRules &rules)
+std::string formatRow(const FlowerRow &h, const VersionRules &rules)
 {
     std::string line = "/tp " + std::to_string(h.cx) + " 64 " + std::to_string(h.cz) + " side=";
-    if (h.winx == h.winz)
-        line += std::to_string(h.winx);
+    if (h.sideX == h.sideZ)
+        line += std::to_string(h.sideX);
     else
-        line += std::to_string(h.winx) + "x" + std::to_string(h.winz);
+        line += std::to_string(h.sideX) + "x" + std::to_string(h.sideZ);
     line += " flowerArea=" + std::to_string(h.flowerArea);
     if (rules.reportPaleArea)
         line += " paleArea=" + std::to_string(h.paleArea);
@@ -357,6 +413,8 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
     {
         return true;
     }
+    if (!pauseOk(control))
+        return false;
 
     const int wx = hit.qx * 4;
     const int wz = hit.qz * 4;
@@ -407,13 +465,15 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
         sampleZ.push_back(flowerZ[i]);
     }
     int flowerY = 0;
+    if (!pauseOk(control))
+        return false;
     if (!flowerExtremes(flowers, sampleX, sampleZ, flowerY))
         return true;
 
     const int cx = wx + winxBlocks / 2;
     const int cz = wz + winzBlocks / 2;
-    const int nx = (int) floorDiv8(cx);
-    const int nz = (int) floorDiv8(cz);
+    if (!pauseOk(control))
+        return false;
     const std::string netherList =
         netherBiomesInWindow(nether, wx, wz, winxBlocks, winzBlocks, mc);
     const bool basalt = netherList.find("basalt_deltas") != std::string::npos;
@@ -424,12 +484,10 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
     row.order = order;
     row.qx = hit.qx;
     row.qz = hit.qz;
-    row.winx = winxBlocks;
-    row.winz = winzBlocks;
+    row.sideX = winxBlocks;
+    row.sideZ = winzBlocks;
     row.cx = cx;
     row.cz = cz;
-    row.nx = nx;
-    row.nz = nz;
     row.paleX = br.pale_qx * 4;
     row.paleZ = br.pale_qz * 4;
     row.swampX = br.swamp_qx * 4;
@@ -449,7 +507,7 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
 
 } // namespace
 
-std::vector<std::string> runFlowerFarmSearch(
+std::vector<FlowerRow> runFlowerFarmSearchRows(
     uint64_t seed,
     int mc,
     int minX,
@@ -463,13 +521,17 @@ std::vector<std::string> runFlowerFarmSearch(
     int threads,
     FlowerSearchControl &control)
 {
-    std::vector<std::string> lines;
+    std::vector<FlowerRow> result;
     if (mc == MC_UNDEF)
         mc = MC_NEWEST;
     if (maxX < minX || maxZ < minZ)
-        return lines;
-    if (threads < 1)
-        threads = 1;
+        return result;
+
+    /* "threads <= 0" or anything above the machine limit means "use all cores". */
+    const unsigned hwThreads = std::thread::hardware_concurrency();
+    const int maxThreads = hwThreads > 0 ? (int) hwThreads : 1;
+    if (threads <= 0 || threads > maxThreads)
+        threads = maxThreads;
 
     const VersionRules rules = rulesForMc(mc);
 
@@ -477,10 +539,13 @@ std::vector<std::string> runFlowerFarmSearch(
     const int windowX = alignDown(longSide, square ? 32 : 8, square ? 64 : 8);
     const int windowZ = square ? windowX : alignDown(shortSide, 8, 8);
     if (windowX <= 0 || windowZ <= 0)
-        return lines;
+        return result;
 
+    CtsBinding binding(control);
+    setPhase(control, 0, 1);
+    setOverall(control, 0, 0);
     if (!pauseOk(control))
-        return lines;
+        return result;
 
     Climate climate{};
     climate_init(&climate, seed, 0);
@@ -491,16 +556,15 @@ std::vector<std::string> runFlowerFarmSearch(
     }
 
     ScanCfg cfg = makeCfg(windowX, windowZ, frameStep <= 4, rules.requirePale ? 0 : 1,
-                          rules.clusterBlocks);
+                          rules.clusterBlocks, threads);
     const int64_t x0 = minX;
     const int64_t z0 = minZ;
     const int64_t x1 = (int64_t) maxX + 1;
     const int64_t z1 = (int64_t) maxZ + 1;
 
+    setPhase(control, 1, 1);
+    setOverall(control, 0, 0);
     cts_bind_progress(reinterpret_cast<int *>(control.current), reinterpret_cast<int *>(control.total));
-    control.phase->store(1);
-    control.total->store(0);
-    control.current->store(0);
 
     Hit *hits = nullptr;
     Hit *hitsZ = nullptr;
@@ -524,14 +588,19 @@ std::vector<std::string> runFlowerFarmSearch(
     {
         std::free(hits);
         std::free(hitsZ);
-        return lines;
+        return result;
     }
 
-    /* Enter phase 2 immediately so the UI does not appear frozen during generator setup. */
-    const int total = nHits + nHitsZ;
-    control.phase->store(2);
-    control.total->store(std::max(1, total));
-    control.current->store(0);
+    /* Phase 2 total: one unit per candidate plus one finalize unit
+     * (cluster / sort / copy), so the bar never sits at 100% while the
+     * tail still runs. */
+    const int phase1Total = std::max(1, loadInt(control.total));
+    const int candidateCount = nHits + nHitsZ;
+    const int phase2Total = candidateCount < INT_MAX ? candidateCount + 1 : INT_MAX;
+    const int overallTotal = phase1Total > INT_MAX - phase2Total
+        ? INT_MAX : phase1Total + phase2Total;
+    setPhase(control, 2, phase2Total);
+    setOverall(control, phase1Total, overallTotal);
 
     Generator overworld{};
     Generator nether{};
@@ -544,7 +613,7 @@ std::vector<std::string> runFlowerFarmSearch(
     initFlowerNoise(flowers);
 
     std::vector<OutRow> rows;
-    rows.reserve((size_t) std::min(total, 4096));
+    rows.reserve((size_t) std::min(candidateCount, 4096));
     int done = 0;
     bool keep = true;
     auto take = [&](const Hit &hit, int winx, int winz, char orient, int order) {
@@ -557,7 +626,8 @@ std::vector<std::string> runFlowerFarmSearch(
         if (keep && accepted)
             rows.push_back(std::move(row));
         done++;
-        control.current->store(done);
+        setPhaseCurrent(control, done);
+        setOverall(control, phase1Total + done, overallTotal);
     };
 
     if (dual)
@@ -577,9 +647,15 @@ std::vector<std::string> runFlowerFarmSearch(
     std::free(hits);
     std::free(hitsZ);
     if (!keep)
-        return lines;
+        return result;
 
-    clusterVerifiedRows(rows, rules.clusterBlocks);
+    /* Candidates are done; keep one phase-2 unit for the finalize step. */
+    setPhaseCurrent(control, candidateCount);
+    setOverall(control, phase1Total + candidateCount, overallTotal);
+    if (!clusterVerifiedRows(rows, rules.clusterBlocks, control))
+        return result;
+    if (!pauseOk(control))
+        return result;
 
     /* Same rule as GUI Sort: cherry first, then nearer to origin. */
     std::sort(rows.begin(), rows.end(), [](const OutRow &a, const OutRow &b) {
@@ -594,9 +670,40 @@ std::vector<std::string> runFlowerFarmSearch(
             return a.qz < b.qz;
         return a.order < b.order;
     });
+    if (!pauseOk(control))
+        return result;
 
-    lines.reserve(rows.size());
+    result.reserve(rows.size());
     for (const OutRow &row : rows)
+        result.push_back(static_cast<const FlowerRow &>(row));
+
+    setPhaseCurrent(control, phase2Total);
+    setOverall(control, overallTotal, overallTotal);
+    return result;
+}
+
+std::vector<std::string> runFlowerFarmSearch(
+    uint64_t seed,
+    int mc,
+    int minX,
+    int minZ,
+    int maxX,
+    int maxZ,
+    int longSide,
+    int shortSide,
+    bool squareOnly,
+    int frameStep,
+    int threads,
+    FlowerSearchControl &control)
+{
+    const int effectiveMc = mc == MC_UNDEF ? MC_NEWEST : mc;
+    const VersionRules rules = rulesForMc(effectiveMc);
+    const std::vector<FlowerRow> rows = runFlowerFarmSearchRows(
+        seed, mc, minX, minZ, maxX, maxZ, longSide, shortSide, squareOnly,
+        frameStep, threads, control);
+    std::vector<std::string> lines;
+    lines.reserve(rows.size());
+    for (const FlowerRow &row : rows)
         lines.push_back(formatRow(row, rules));
     return lines;
 }

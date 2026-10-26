@@ -116,10 +116,12 @@ public final class FlowerFarmFinderBridge {
         int longSide, int shortSide, int squareOnly, int frameStep, int numThreads, String mcVersion);
 
     /**
-     * Progress query. Returns {@code [current, total, phase, status, tryPause, tryStop]} or {@code null} if idle.
-     * {@code phase}: 1 = phase-1 scan, 2 = refinement, -1 = finishing.
-     * {@code status}: phase 1: 0 = chunks active, 1 = no chunk in flight; phase 2: 1 = refining, 2 = refinement step done.
-     * {@code tryPause} / {@code tryStop}: 1 if native pause/stop was requested (async; use with {@code status} for settled pause).
+     * Progress query. Returns
+     * {@code [current, total, phase, status, tryPause, tryStop,
+     * phaseCurrent, phaseTotal, overallCurrent, overallTotal]}, or {@code null} if idle.
+     * {@code current}/{@code total} describe the current phase.
+     * {@code phase}: 0 = preparation, 1 = climate screen, 2 = verification.
+     * {@code status}: phase 2: 1 = verifying, 2 = verification done; other phases: 1.
      */
     public static native int[] getSearchProgress();
 

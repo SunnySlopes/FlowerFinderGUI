@@ -387,8 +387,13 @@ public class FlowerFarmFinderFrame extends JFrame {
             viewField.setText(String.valueOf(FLOWER_VIEW_DEFAULT));
             return;
         }
-        int side = view * 32;
-        if (side < FLOWER_LONG_MIN || side > FLOWER_LONG_MAX) {
+        // Square demand area: 32 blocks per simulation-distance chunk + 16
+        // blocks margin.  The long-side cap is 1024, so view=32 is clamped.
+        int side = view * 32 + 16;
+        if (side > FLOWER_LONG_MAX) {
+            side = FLOWER_LONG_MAX;
+        }
+        if (side < FLOWER_LONG_MIN) {
             JOptionPane.showMessageDialog(this, getString("error.viewDistanceInvalid"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
             return;
         }
@@ -397,9 +402,13 @@ public class FlowerFarmFinderFrame extends JFrame {
         if (shortBox != null) {
             shortBox.setSelected(false);
             if (shortBox == searchShortSideCheckBox && searchShortSideField != null) {
+                searchShortSideField.setText(String.valueOf(side));
+                rememberSide(searchShortSideField, side);
                 searchShortSideField.setEnabled(false);
             }
             if (shortBox == listShortSideCheckBox && listShortSideField != null) {
+                listShortSideField.setText(String.valueOf(side));
+                rememberSide(listShortSideField, side);
                 listShortSideField.setEnabled(false);
             }
         }
@@ -1850,7 +1859,9 @@ public class FlowerFarmFinderFrame extends JFrame {
 
             searchElapsedTimeLabel.setText(getString("elapsedTime", formatTime(info.elapsedMs())));
             if (isSearchPaused) {
-                searchRemainingTimeLabel.setText(getString("remainingTime.paused"));
+                searchRemainingTimeLabel.setText(info.nativePauseSettled()
+                        ? getString("remainingTime.paused")
+                        : getString("remainingTime.calculating"));
                 return;
             }
             if (info.phase() == -1) {

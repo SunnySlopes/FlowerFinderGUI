@@ -59,6 +59,8 @@ typedef struct {
     double pm_e, pm_h;   /* perimeter pre-check margins */
     int full_verify;     /* 1 = full 4-block verify; 0 = accept the perimeter */
     int no_pale;         /* 1 = coarse E/H only needs swamp hi-E + flower lo-H */
+    int threads;         /* explicit OpenMP team size (0 = library default) */
+    int max_threads;     /* machine limit; fixes the tile grid independent of threads */
 } ScanCfg;
 
 typedef struct {
@@ -168,6 +170,13 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
 
 /* Optional search progress. current/total are plain ints updated atomically. */
 void cts_bind_progress(int *current, int *total);
+
+/* Optional cooperative control.  stopped() is a cheap non-blocking check;
+ * checkpoint() blocks while paused and returns nonzero when the search must
+ * abort (stopped, including a stop issued during a pause).  Both callbacks are
+ * called from worker threads and must be thread-safe.  Pass NULL to unbind. */
+typedef int (*CtsControlFn)(void *user);
+void cts_bind_control(CtsControlFn stopped, CtsControlFn checkpoint, void *user);
 
 #ifdef __cplusplus
 }

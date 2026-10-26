@@ -13,11 +13,34 @@ static int *prog_cur;
 static int *prog_tot;
 static int prog_preset;
 
+static CtsControlFn ctl_stopped_fn;
+static CtsControlFn ctl_checkpoint_fn;
+static void *ctl_user;
+
 void cts_bind_progress(int *current, int *total)
 {
     prog_cur = current;
     prog_tot = total;
     prog_preset = 0;
+}
+
+void cts_bind_control(CtsControlFn stopped, CtsControlFn checkpoint, void *user)
+{
+    ctl_stopped_fn = stopped;
+    ctl_checkpoint_fn = checkpoint;
+    ctl_user = user;
+}
+
+/* Cheap non-blocking check, safe in OpenMP loops. */
+static int cts_stopped(void)
+{
+    return ctl_stopped_fn && ctl_stopped_fn(ctl_user);
+}
+
+/* Waits while paused; returns nonzero when the caller must abort. */
+static int cts_checkpoint(void)
+{
+    return ctl_checkpoint_fn ? ctl_checkpoint_fn(ctl_user) : 0;
 }
 
 static void progress_set_total(int n)
@@ -37,6 +60,31 @@ static void progress_tick(void)
     if (prog_cur)
         __atomic_fetch_add(prog_cur, 1, __ATOMIC_RELAXED);
 }
+
+/* Never leave the UI at 99% after the real work finished. */
+static void progress_finish(void)
+{
+    if (prog_cur && prog_tot) {
+        int tot = __atomic_load_n(prog_tot, __ATOMIC_RELAXED);
+        if (tot > 0)
+            __atomic_store_n(prog_cur, tot, __ATOMIC_RELAXED);
+    }
+}
+
+static int clamp_progress_total(int64_t n)
+{
+    if (n < 1) return 1;
+    if (n > 0x7fffffff) return 0x7fffffff;
+    return (int)n;
+}
+
+/* Defined below; used by the scan entry points before their definitions. */
+static int rect_both_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+                          const ScanCfg *cfg, int64_t step_l0);
+static int rect_single_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+                            const ScanCfg *cfg, int64_t step_l0);
+static int square_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+                       const ScanCfg *cfg, int64_t step_l0);
 
 /* Swamp needs high E, flower needs low H. Pale also needs low E + high H. */
 static int eh_span_ok(double emin, double emax, double hmin, double hmax,
@@ -126,6 +174,7 @@ static int push_hit(Hit **hits, int *nhits, int *cap, Hit h, int max_hits)
 {
     int i;
     for (i = 0; i < *nhits; i++) {
+        if ((i & 255) == 0 && cts_checkpoint()) return 0;
         if ((*hits)[i].qx == h.qx && (*hits)[i].qz == h.qz) return 1;
     }
     if (*nhits >= max_hits) return 1;
@@ -153,17 +202,22 @@ static double hit_score(const Hit *h, const ScanCfg *cfg)
 }
 
 /* Merge hits that are within cfg->cluster blocks (Chebyshev) of a rep;
- * keep the one with the largest margin score.  O(n * reps), reps is small. */
-static void cluster_hits(Hit **hits, int *nhits, const ScanCfg *cfg)
+ * keep the one with the largest margin score.  O(n * reps), reps is small.
+ * Returns 0 when stopped; the original list is left untouched in that case. */
+static int cluster_hits(Hit **hits, int *nhits, const ScanCfg *cfg)
 {
     int n = *nhits, m = 0, i, j;
     Hit *out;
-    if (n <= 1 || cfg->cluster <= 0) return;
+    if (n <= 1 || cfg->cluster <= 0) return 1;
     out = (Hit *)malloc((size_t)n * sizeof(Hit));
-    if (!out) return;
+    if (!out) return 1;
     for (i = 0; i < n; i++) {
         const Hit *h = &(*hits)[i];
         int found = -1;
+        if ((i & 255) == 0 && cts_checkpoint()) {
+            free(out);
+            return 0;
+        }
         for (j = 0; j < m; j++) {
             if (abs(h->qx - out[j].qx) * 4 <= cfg->cluster &&
                 abs(h->qz - out[j].qz) * 4 <= cfg->cluster) {
@@ -180,6 +234,7 @@ static void cluster_hits(Hit **hits, int *nhits, const ScanCfg *cfg)
     free(*hits);
     *hits = out;
     *nhits = m;
+    return 1;
 }
 
 /* ---------------- multigrid screen ---------------- */
@@ -235,6 +290,7 @@ static int try_candidate(const Climate *c, const ScanCfg *cfg,
 {
     WindowEval w, wp;
     int jj, near = 0;
+    if (cts_checkpoint()) return 0;
     if (tx > qx1 - winx || tz > qz1 - winz) return 1;
     if (cfg->cluster > 0) {
         for (jj = 0; jj < *nhits; jj++) {
@@ -306,6 +362,7 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
     float *ef = NULL, *hf = NULL;
     double t0, t1;
     int cap = 0;
+    int stopped = 0;
     memset(st, 0, sizeof(*st));
     *hits = NULL; *nhits = 0;
     if (bx1 <= bx0 || bz1 <= bz0) return 0;
@@ -328,10 +385,16 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
     el = (float *)malloc((size_t)gnx * gny * sizeof(float));
     hh = (float *)malloc((size_t)gnx * gny * sizeof(float));
     if (!el || !hh) { free(el); free(hh); return 0; }
-    progress_expect(gny);
-#pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    {
+        int64_t windows = (gnx >= ns && gny >= ns)
+            ? (int64_t)(gnx - ns + 1) * (gny - ns + 1) : 0;
+        /* The final +1 is the merge/cluster unit, ticked after the scan. */
+        progress_expect(clamp_progress_total((int64_t)gny + windows + 1));
+    }
+#pragma omp parallel for schedule(static) num_threads(cfg->threads) if(!omp_in_parallel())
     for (j = 0; j < gny; j++) {
         int ii;
+        if (cts_checkpoint()) continue;
         for (ii = 0; ii < gnx; ii++) {
             double qx = (double)(qx0 + ii * s0);
             double qz = (double)(qz0 + j * s0);
@@ -342,18 +405,22 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
         }
         progress_tick();
     }
+    if (cts_stopped()) stopped = 1;
+    if (stopped) goto done;
     t1 = now_sec();
     st->t_fill = t1 - t0;
     st->points += (int64_t)gnx * gny;
 
     for (j = 0; j + ns - 1 < gny; j++) {
         int bz = qz0 + j * s0;
-        if (bz > qz1 - win) continue;
+        int bz_ok = bz <= qz1 - win;
         for (i = 0; i + ns - 1 < gnx; i++) {
             int bx = qx0 + i * s0;
             double emin = 1e30, emax = -1e30, hmin = 1e30, hmax = -1e30;
             int a, b;
-            if (bx > qx1 - win) continue;
+            if (((i + j) & 255) == 0 && cts_checkpoint()) { stopped = 1; goto done; }
+            progress_tick();
+            if (!bz_ok || bx > qx1 - win) continue;
             for (b = 0; b < ns; b++) {
                 for (a = 0; a < ns; a++) {
                     double ev = el[(size_t)(j + b) * gnx + (i + a)];
@@ -367,6 +434,7 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
             if (!eh_span_ok(emin, emax, hmin, hmax, cfg, bg + m_e, m_h))
                 continue;
             st->cand_l0++;
+            if (cts_checkpoint()) { stopped = 1; goto done; }
             {
                 int best_ax = 0, best_az = 0, have_best = 0;
                 double best_score = -1e30;
@@ -521,6 +589,7 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
                                     cfg, 0.04, 0.04))
                         continue;
                     st->cand_l1++;
+                    if (cts_checkpoint()) { stopped = 1; goto done; }
                     noff = cfg->offsets;
                     if (noff < 1) noff = 1;
                     if (noff > 2) noff = 2;
@@ -544,10 +613,20 @@ done:
     free(el); free(hh);
     free(ef); free(hf);
     free(l0minE); free(l0maxE); free(l0minH); free(l0maxH);
-    if (cfg->cluster > 0) cluster_hits(hits, nhits, cfg);
+    if (!stopped && cfg->cluster > 0 &&
+        !cluster_hits(hits, nhits, cfg))
+        stopped = 1;
+    if (stopped) {
+        free(*hits);
+        *hits = NULL;
+        *nhits = 0;
+    } else if (!prog_preset) {
+        progress_tick();      /* merge/cluster unit */
+        progress_finish();
+    }
     st->t_total = now_sec() - t0;
     st->hits = *nhits;
-    return 1;
+    return stopped ? 0 : 1;
 }
 /* Rectangular mode: direct 320/640-style window sweep.  The square path keeps
  * its multigrid L0/L1 cascade; a 640x320 window is wide enough that the direct
@@ -557,7 +636,8 @@ static int screen_area_rect(const Climate *c, int64_t bx0, int64_t bz0,
                             int64_t step_l0, double m_e, double m_h, double bg,
                             Hit **hits, int *nhits, ScanStats *st)
 {
-    int qx0, qx1, qz0, qz1, winx, winz, sx, sz, bx, bz, cap = 0;
+    int qx0, qx1, qz0, qz1, winx, winz, sx, bx, bz, cap = 0;
+    int stopped = 0;
     double t0 = now_sec();
     (void)bg;
     memset(st, 0, sizeof(*st));
@@ -571,10 +651,17 @@ static int screen_area_rect(const Climate *c, int64_t bx0, int64_t bz0,
         return 0;
     sx = (int)(step_l0 / 4);
     if (sx < 4) sx = 4;
+    progress_expect(clamp_progress_total(
+        (int64_t)rect_single_work(bx0, bz0, bx1, bz1, cfg, step_l0) + 1));
     for (bz = qz0; bz + winz - 1 <= qz1; bz += sx) {
         for (bx = qx0; bx + winx - 1 <= qx1; bx += sx) {
             WindowEval wp;
             st->windows++;
+            if ((st->windows & 63) == 0 && cts_checkpoint()) {
+                stopped = 1;
+                goto done;
+            }
+            progress_tick();
             /* coarse E/H boundary prefilter at 16-block spacing */
             window_eval_perimeter_rect(c, bx, bz, winx, winz, 4, 0, &wp);
             st->points += (int64_t)2 * (winx / 4 + winz / 4 + 2);
@@ -582,14 +669,27 @@ static int screen_area_rect(const Climate *c, int64_t bx0, int64_t bz0,
                 continue;
             st->cand_l1++;
             if (!try_candidate(c, cfg, winx, winz, qx1, qz1, st, hits, nhits,
-                               &cap, bx, bz))
-                return 0;
+                               &cap, bx, bz)) {
+                stopped = 1;
+                goto done;
+            }
         }
     }
-    if (cfg->cluster > 0) cluster_hits(hits, nhits, cfg);
+done:
+    if (!stopped && cfg->cluster > 0 &&
+        !cluster_hits(hits, nhits, cfg))
+        stopped = 1;
+    if (stopped) {
+        free(*hits);
+        *hits = NULL;
+        *nhits = 0;
+    } else if (!prog_preset) {
+        progress_tick();
+        progress_finish();
+    }
     st->hits = *nhits;
     st->t_total = now_sec() - t0;
-    return 1;
+    return stopped ? 0 : 1;
 }
 
 static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
@@ -624,10 +724,19 @@ static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
             if (ix >= ow) break;
             k = (size_t)iz * ow + ix;
             st->windows++;
+            if ((st->windows & 63) == 0 && cts_checkpoint()) {
+                free(mne); free(mxe); free(mnh); free(mxh);
+                return 0;
+            }
+            progress_tick();
             if (!eh_span_ok(mne[k], mxe[k], mnh[k], mxh[k], cfg,
                             m_e + 0.02, m_h + 0.02))
                 continue;
             st->cand_l1++;
+            if (cts_checkpoint()) {
+                free(mne); free(mxe); free(mnh); free(mxh);
+                return 0;
+            }
             if (!try_candidate(c, cfg, winx, winz, qx1, qz1, st, hits, nhits,
                                cap, bx, bz)) {
                 free(mne); free(mxe); free(mnh); free(mxh);
@@ -645,9 +754,10 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
                           Hit **hits_x, int *nhits_x,
                           Hit **hits_z, int *nhits_z, ScanStats *st)
 {
-    int qx0, qx1, qz0, qz1, winx, winz, gw, gh, ix, iz, cg = 16;
+    int qx0, qx1, qz0, qz1, winx, winz, gw, gh, iz, cg = 16;
     float *ef = NULL, *hf = NULL;
     int capx = 0, capz = 0, stepq;
+    int stopped = 0;
     double t0 = now_sec();
     memset(st, 0, sizeof(*st));
     *hits_x = NULL; *nhits_x = 0;
@@ -667,10 +777,12 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     ef = (float *)malloc((size_t)gw * gh * sizeof(float));
     hf = (float *)malloc((size_t)gw * gh * sizeof(float));
     if (!ef || !hf) { free(ef); free(hf); return 0; }
-    progress_expect(gh);
-#pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    progress_expect(clamp_progress_total(
+        (int64_t)rect_both_work(bx0, bz0, bx1, bz1, cfg, step_l0) + 1));
+#pragma omp parallel for schedule(static) num_threads(cfg->threads) if(!omp_in_parallel())
     for (iz = 0; iz < gh; iz++) {
         int xx;
+        if (cts_checkpoint()) continue;
         for (xx = 0; xx < gw; xx++) {
             double e, h;
             climate_sample(c, (double)(qx0 + xx * cg),
@@ -680,6 +792,8 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
         }
         progress_tick();
     }
+    if (cts_stopped()) stopped = 1;
+    if (stopped) goto done;
     st->points += (int64_t)gw * gh;
     stepq = (int)(step_l0 / 4 / cg) * cg;
     if (stepq < cg) stepq = cg;
@@ -689,17 +803,26 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
         !eval_rect_orientation(c, cfg, ef, hf, gw, gh, qx0, qz0, cg,
                                winz, winx, stepq, qx1, qz1, m_e, m_h,
                                hits_z, nhits_z, &capz, st)) {
-        free(ef); free(hf);
-        return 0;
+        stopped = 1;
+        goto done;
     }
+done:
     free(ef); free(hf);
-    if (cfg->cluster > 0) {
-        cluster_hits(hits_x, nhits_x, cfg);
-        cluster_hits(hits_z, nhits_z, cfg);
+    if (!stopped && cfg->cluster > 0) {
+        if (!cluster_hits(hits_x, nhits_x, cfg) ||
+            !cluster_hits(hits_z, nhits_z, cfg))
+            stopped = 1;
+    }
+    if (stopped) {
+        free(*hits_x); *hits_x = NULL; *nhits_x = 0;
+        free(*hits_z); *hits_z = NULL; *nhits_z = 0;
+    } else if (!prog_preset) {
+        progress_tick();      /* merge/cluster unit */
+        progress_finish();
     }
     st->hits = *nhits_x + *nhits_z;
     st->t_total = now_sec() - t0;
-    return 1;
+    return stopped ? 0 : 1;
 }
 
 static int64_t align_tile_start(int64_t block, int64_t origin, int64_t step_blocks)
@@ -717,9 +840,25 @@ typedef struct {
     ScanStats st;
 } BothTile;
 
-static int rect_rows(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1, const ScanCfg *cfg)
+static int rect_orient_count(int qx0, int qx1, int qz0, int qz1,
+                             int winx, int winz, int cg, int stepq)
 {
-    int qx0, qx1, qz0, qz1, winx, winz, cg = 16, gh;
+    int gw = (qx1 - qx0) / cg + 3;
+    int gh = (qz1 - qz0) / cg + 3;
+    int cw = winx / cg, ch = winz / cg;
+    int64_t nx, nz;
+    if (cw <= 0 || ch <= 0 || gw - cw + 1 <= 0 || gh - ch + 1 <= 0)
+        return 0;
+    nx = (int64_t)(qx1 - qx0 - winx + 1) / stepq + 1;
+    nz = (int64_t)(qz1 - qz0 - winz + 1) / stepq + 1;
+    if (nx < 0 || nz < 0) return 0;
+    return clamp_progress_total(nx * nz);
+}
+
+static int rect_both_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+                          const ScanCfg *cfg, int64_t step_l0)
+{
+    int qx0, qx1, qz0, qz1, winx, winz, cg = 16, gh, stepq, a, b;
     if (bx1 <= bx0 || bz1 <= bz0) return 0;
     qx0 = (int)floor_div4(bx0); qz0 = (int)floor_div4(bz0);
     qx1 = (int)floor_div4(bx1 - 1); qz1 = (int)floor_div4(bz1 - 1);
@@ -731,13 +870,39 @@ static int rect_rows(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1, const S
     if (winx % cg || winz % cg) cg = 2;
     if (winx % cg || winz % cg) return 0;
     gh = (qz1 - qz0) / cg + 3;
-    return gh > 0 ? gh : 0;
+    stepq = (int)(step_l0 / 4 / cg) * cg;
+    if (stepq < cg) stepq = cg;
+    a = rect_orient_count(qx0, qx1, qz0, qz1, winx, winz, cg, stepq);
+    b = rect_orient_count(qx0, qx1, qz0, qz1, winz, winx, cg, stepq);
+    return clamp_progress_total((int64_t)gh + a + b);
 }
 
-static int square_rows(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+static int rect_single_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
+                            const ScanCfg *cfg, int64_t step_l0)
+{
+    int qx0, qx1, qz0, qz1, winx, winz, sx;
+    int64_t nx, nz;
+    if (bx1 <= bx0 || bz1 <= bz0) return 0;
+    qx0 = (int)floor_div4(bx0); qz0 = (int)floor_div4(bz0);
+    qx1 = (int)floor_div4(bx1 - 1); qz1 = (int)floor_div4(bz1 - 1);
+    winx = cfg->window / 4;
+    winz = cfg->window_z / 4;
+    if (winx <= 0 || winz <= 0 ||
+        qx1 - qx0 + 1 < winx || qz1 - qz0 + 1 < winz)
+        return 0;
+    sx = (int)(step_l0 / 4);
+    if (sx < 4) sx = 4;
+    nx = (int64_t)(qx1 - qx0 - winx + 1) / sx + 1;
+    nz = (int64_t)(qz1 - qz0 - winz + 1) / sx + 1;
+    if (nx < 0 || nz < 0) return 0;
+    return clamp_progress_total(nx * nz);
+}
+
+static int square_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
                        const ScanCfg *cfg, int64_t step_l0)
 {
-    int qx0, qx1, qz0, qz1, win, s0, l1, w1, ns, gny, span;
+    int qx0, qx1, qz0, qz1, win, s0, l1, w1, ns, span, gnx, gny;
+    int64_t windows = 0;
     if (bx1 <= bx0 || bz1 <= bz0) return 0;
     qx0 = (int)floor_div4(bx0); qz0 = (int)floor_div4(bz0);
     qx1 = (int)floor_div4(bx1 - 1); qz1 = (int)floor_div4(bz1 - 1);
@@ -749,16 +914,20 @@ static int square_rows(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
     w1 = win / l1;
     ns = win / s0 + 2;
     if (win % l1 || w1 < 2 || ns < 2) return 0;
-    span = (qz1 - qz0) + win + s0;
-    gny = span / s0 + 3;
-    return gny > 0 ? gny : 0;
+    span = (qx1 - qx0) + win + s0;
+    gnx = span / s0 + 3;
+    gny = ((qz1 - qz0) + win + s0) / s0 + 3;
+    if (gnx >= ns && gny >= ns)
+        windows = (int64_t)(gnx - ns + 1) * (gny - ns + 1);
+    return clamp_progress_total((int64_t)gny + windows);
 }
 
 static void preset_tile_rows(int ntx, int ntz, int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
                              int64_t tw, int64_t th, int64_t overlap, int64_t step_l0,
                              const ScanCfg *cfg, int square)
 {
-    int t, sum = 0;
+    int t;
+    int64_t sum = 0;
     for (t = 0; t < ntx * ntz; t++) {
         int64_t xa, xb, za, zb;
         int xx = t % ntx, zz = t / ntx;
@@ -773,11 +942,14 @@ static void preset_tile_rows(int ntx, int ntz, int64_t bx0, int64_t bz0, int64_t
         zb += overlap; if (zb > bz1) zb = bz1;
         xa = align_tile_start(xa, bx0, step_l0);
         za = align_tile_start(za, bz0, step_l0);
-        sum += square ? square_rows(xa, za, xb, zb, cfg, step_l0)
-                      : rect_rows(xa, za, xb, zb, cfg);
+        sum += square ? square_work(xa, za, xb, zb, cfg, step_l0)
+                      : rect_both_work(xa, za, xb, zb, cfg, step_l0);
     }
     if (sum > 0) {
-        progress_set_total(sum);
+        progress_set_total(clamp_progress_total(sum + 1));
+        prog_preset = 1;
+    } else {
+        progress_set_total(1);
         prog_preset = 1;
     }
 }
@@ -790,6 +962,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                                    Hit **hits_z, int *nhits_z, ScanStats *st)
 {
     int nt = threads > 0 ? threads : 1;
+    int gridNt = cfg->max_threads > 0 ? cfg->max_threads : nt;
     int ntx, ntz, tx, tz, t, i;
     int64_t tw, th, overlap;
     BothTile *tr;
@@ -798,19 +971,28 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     double t0 = now_sec();
 #ifdef _OPENMP
     if (threads <= 0) nt = omp_get_max_threads();
+    {
+        int procs = omp_get_num_procs();
+        if (procs > 0) {
+            if (nt > procs) nt = procs;
+            if (gridNt > procs) gridNt = procs;
+        }
+    }
 #endif
     if (nt < 1) nt = 1;
-    if (nt > 32) nt = 32;
+    if (gridNt < 1) gridNt = 1;
     if (bx1 - bx0 < 2 * (int64_t)(cfg->window > cfg->window_z ? cfg->window : cfg->window_z) ||
-        bz1 - bz0 < 2 * (int64_t)(cfg->window > cfg->window_z ? cfg->window : cfg->window_z))
+        bz1 - bz0 < 2 * (int64_t)(cfg->window > cfg->window_z ? cfg->window : cfg->window_z)) {
         nt = 1;
-    if (nt == 1)
+        gridNt = 1;
+    }
+    if (gridNt == 1)
         return screen_area_rect_both(c, bx0, bz0, bx1, bz1, cfg, step_l0,
                                      m_e, m_h, hits_x, nhits_x,
                                      hits_z, nhits_z, st);
     overlap = (cfg->window > cfg->window_z ? cfg->window : cfg->window_z) + step_l0;
-    ntx = (int)ceil(sqrt((double)nt));
-    ntz = (nt + ntx - 1) / ntx;
+    ntx = (int)ceil(sqrt((double)gridNt));
+    ntz = (gridNt + ntx - 1) / ntx;
     tw = (bx1 - bx0 + ntx - 1) / ntx;
     th = (bz1 - bz0 + ntz - 1) / ntz;
     tr = (BothTile *)calloc((size_t)ntx * ntz, sizeof(*tr));
@@ -819,7 +1001,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                                      m_e, m_h, hits_x, nhits_x,
                                      hits_z, nhits_z, st);
     preset_tile_rows(ntx, ntz, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0, cfg, 0);
-#pragma omp parallel for schedule(dynamic,1)
+#pragma omp parallel for schedule(dynamic,1) num_threads(nt)
     for (t = 0; t < ntx * ntz; t++) {
         int64_t xa, xb, za, zb;
         int xx = t % ntx, zz = t / ntx;
@@ -828,6 +1010,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         xb = xa + tw; if (xb > bx1) xb = bx1;
         zb = za + th; if (zb > bz1) zb = bz1;
         if (xa >= xb || za >= zb) continue;
+        if (cts_checkpoint()) continue;
         xa -= overlap; if (xa < bx0) xa = bx0;
         za -= overlap; if (za < bz0) za = bz0;
         xb += overlap; if (xb > bx1) xb = bx1;
@@ -839,16 +1022,13 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                               &tr[t].hz, &tr[t].nz, &tr[t].st);
     }
     prog_preset = 0;
-    /* Mark phase-1 work complete before the merge so the UI is not stuck at <100%. */
-    if (prog_cur && prog_tot) {
-        int tot = __atomic_load_n(prog_tot, __ATOMIC_RELAXED);
-        if (tot > 0)
-            __atomic_store_n(prog_cur, tot, __ATOMIC_RELAXED);
-    }
+    if (cts_stopped())
+        goto stopped;
     for (t = 0; t < ntx * ntz; t++) {
         if (cfg->cluster > 0) {
-            cluster_hits(&tr[t].hx, &tr[t].nx, cfg);
-            cluster_hits(&tr[t].hz, &tr[t].nz, cfg);
+            if (!cluster_hits(&tr[t].hx, &tr[t].nx, cfg) ||
+                !cluster_hits(&tr[t].hz, &tr[t].nz, cfg))
+                goto stopped;
         }
         totalx += tr[t].nx;
         totalz += tr[t].nz;
@@ -894,12 +1074,31 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     *hits_x = ax; *nhits_x = (int)totalx;
     *hits_z = az; *nhits_z = (int)totalz;
     if (cfg->cluster > 0) {
-        cluster_hits(hits_x, nhits_x, cfg);
-        cluster_hits(hits_z, nhits_z, cfg);
+        if (!cluster_hits(hits_x, nhits_x, cfg) ||
+            !cluster_hits(hits_z, nhits_z, cfg))
+            goto stopped_final;
     }
+    if (cts_stopped())
+        goto stopped_final;
+    progress_tick();          /* merge/cluster unit */
+    progress_finish();
     st->hits = *nhits_x + *nhits_z;
     st->t_total = now_sec() - t0;
     return 1;
+
+stopped:
+    for (t = 0; t < ntx * ntz; t++) { free(tr[t].hx); free(tr[t].hz); }
+    free(tr);
+    free(ax); free(az);
+    *hits_x = NULL; *nhits_x = 0;
+    *hits_z = NULL; *nhits_z = 0;
+    return 0;
+
+stopped_final:
+    free(ax); free(az);
+    *hits_x = NULL; *nhits_x = 0;
+    *hits_z = NULL; *nhits_z = 0;
+    return 0;
 }
 
 int screen_area(const Climate *c, int64_t bx0, int64_t bz0,
@@ -926,28 +1125,38 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                          int threads, Hit **hits, int *nhits, ScanStats *st)
 {
     int nt = threads > 0 ? threads : 1;
+    int gridNt = cfg->max_threads > 0 ? cfg->max_threads : nt;
     int ntx, ntz, tx, tz, t;
     int64_t tw, th, overlap;
     TileOut *tr;
     size_t total = 0;
-    Hit *all;
+    Hit *all = NULL;
     int i;
 #ifdef _OPENMP
     if (threads <= 0) nt = omp_get_max_threads();
+    {
+        int procs = omp_get_num_procs();
+        if (procs > 0) {
+            if (nt > procs) nt = procs;
+            if (gridNt > procs) gridNt = procs;
+        }
+    }
 #endif
     if (nt < 1) nt = 1;
-    if (nt > 32) nt = 32;
+    if (gridNt < 1) gridNt = 1;
     {
         int64_t maxwin = cfg->window > cfg->window_z ? cfg->window : cfg->window_z;
-        if (bx1 - bx0 < maxwin || bz1 - bz0 < maxwin)
+        if (bx1 - bx0 < maxwin || bz1 - bz0 < maxwin) {
             nt = 1;
+            gridNt = 1;
+        }
     }
-    if (nt == 1)
+    if (gridNt == 1)
         return screen_area(c, bx0, bz0, bx1, bz1, cfg, step_l0, m_e, m_h,
                            bg, hits, nhits, st);
 
-    ntx = (int)ceil(sqrt((double)nt));
-    ntz = (nt + ntx - 1) / ntx;
+    ntx = (int)ceil(sqrt((double)gridNt));
+    ntz = (gridNt + ntx - 1) / ntx;
     tw = (bx1 - bx0 + ntx - 1) / ntx;
     th = (bz1 - bz0 + ntz - 1) / ntz;
     overlap = (cfg->window > cfg->window_z ? cfg->window : cfg->window_z) + step_l0;
@@ -957,7 +1166,7 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                            bg, hits, nhits, st);
     preset_tile_rows(ntx, ntz, bx0, bz0, bx1, bz1, tw, th, overlap, step_l0, cfg, 1);
 
-#pragma omp parallel for schedule(dynamic,1)
+#pragma omp parallel for schedule(dynamic,1) num_threads(nt)
     for (t = 0; t < ntx * ntz; t++) {
         int64_t xa, xb, za, zb;
         int xx = t % ntx, zz = t / ntx;
@@ -966,6 +1175,7 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         xb = xa + tw; if (xb > bx1) xb = bx1;
         zb = za + th; if (zb > bz1) zb = bz1;
         if (xa >= xb || za >= zb) continue;
+        if (cts_checkpoint()) continue;
         xa -= overlap; if (xa < bx0) xa = bx0;
         za -= overlap; if (za < bz0) za = bz0;
         xb += overlap; if (xb > bx1) xb = bx1;
@@ -976,15 +1186,12 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
                     &tr[t].hits, &tr[t].nhits, &tr[t].st);
     }
     prog_preset = 0;
-    if (prog_cur && prog_tot) {
-        int tot = __atomic_load_n(prog_tot, __ATOMIC_RELAXED);
-        if (tot > 0)
-            __atomic_store_n(prog_cur, tot, __ATOMIC_RELAXED);
-    }
-
+    if (cts_stopped())
+        goto stopped;
     for (t = 0; t < ntx * ntz; t++) {
-        if (cfg->cluster > 0)
-            cluster_hits(&tr[t].hits, &tr[t].nhits, cfg);
+        if (cfg->cluster > 0 &&
+            !cluster_hits(&tr[t].hits, &tr[t].nhits, cfg))
+            goto stopped;
         total += tr[t].nhits;
     }
     all = (Hit *)malloc((total ? total : 1) * sizeof(Hit));
@@ -1020,8 +1227,25 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     free(tr);
     *hits = all;
     *nhits = (int)total;
-    if (cfg->cluster > 0) cluster_hits(hits, nhits, cfg);
+    if (cfg->cluster > 0 && !cluster_hits(hits, nhits, cfg))
+        goto stopped_final;
+    if (cts_stopped())
+        goto stopped_final;
+    progress_tick();          /* merge/cluster unit */
+    progress_finish();
     st->hits = *nhits;
     return 1;
+
+stopped:
+    for (t = 0; t < ntx * ntz; t++) free(tr[t].hits);
+    free(tr);
+    free(all);
+    *hits = NULL; *nhits = 0;
+    return 0;
+
+stopped_final:
+    free(all);
+    *hits = NULL; *nhits = 0;
+    return 0;
 }
 

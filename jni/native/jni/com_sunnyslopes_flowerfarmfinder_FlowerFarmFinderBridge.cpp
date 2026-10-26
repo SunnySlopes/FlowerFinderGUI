@@ -14,8 +14,9 @@
 struct Progress {
     std::atomic_int current{0};
     std::atomic_int total{0};
-    std::atomic_int chunkInRunning{0};
-    std::atomic_int phase1{0};
+    std::atomic_int phase{0};          // 0 = preparation, 1 = screen, 2 = verify
+    std::atomic_int overallCurrent{0};
+    std::atomic_int overallTotal{0};
     std::atomic_bool try_pause{false};
     std::atomic_bool try_stop{false};
 };
@@ -25,10 +26,11 @@ static Progress progress{};
 
 static void resetProgressState()
 {
-    progress.chunkInRunning.store(0);
     progress.current.store(0);
     progress.total.store(0);
-    progress.phase1.store(0);
+    progress.phase.store(0);
+    progress.overallCurrent.store(0);
+    progress.overallTotal.store(0);
     progress.try_pause.store(false);
     progress.try_stop.store(false);
 }
@@ -52,10 +54,18 @@ JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmF
     }
     resetProgressState();
     FlowerSearchControl control{
-        &progress.current, &progress.total, &progress.phase1,
-        &progress.try_pause, &progress.try_stop
+        &progress.current, &progress.total, &progress.phase,
+        &progress.try_pause, &progress.try_stop,
+        &progress.current, &progress.total,
+        &progress.overallCurrent, &progress.overallTotal
     };
-    int threads = numThreads > 0 ? (int) numThreads : (int) std::thread::hardware_concurrency();
+    unsigned hw = std::thread::hardware_concurrency();
+    int maxThreads = hw > 0 ? (int) hw : 1;
+    int threads = numThreads > 0 ? (int) numThreads : maxThreads;
+    if (threads < 1)
+        threads = 1;
+    if (threads > maxThreads)
+        threads = maxThreads;
     std::vector<std::string> lines;
     try {
         lines = runFlowerFarmSearch((uint64_t) seed, mc, minX, minZ, maxX, maxZ,
@@ -92,26 +102,33 @@ JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmF
 JNIEXPORT jintArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge_getSearchProgress
   (JNIEnv *env, jclass)
 {
-    if (progress.total.load() <= 0)
+    int tot = progress.total.load();
+    if (tot <= 0)
         return nullptr;
 
-    int status = 0;
-    int phase = progress.phase1.load();
+    int phase = progress.phase.load();
     int cur = progress.current.load();
-    int tot = progress.total.load();
-    if (phase == 0 || phase == 1)
-        status = progress.chunkInRunning.load() == 0 ? 1 : 0;
-    else if (phase == 2)
+    int status = 1;
+    if (phase == 2)
         status = cur >= tot ? 2 : 1;
+    int overallCur = progress.overallCurrent.load();
+    int overallTot = progress.overallTotal.load();
+    if (overallTot <= 0) {
+        overallCur = cur;
+        overallTot = tot;
+    }
 
-    jint data[6] = {
+    jint data[10] = {
         cur, tot, phase, status,
-        progress.try_pause.load() ? 1 : 0, progress.try_stop.load() ? 1 : 0
+        progress.try_pause.load() ? 1 : 0,
+        progress.try_stop.load() ? 1 : 0,
+        progress.current.load(), progress.total.load(),
+        overallCur, overallTot
     };
-    jintArray arr = env->NewIntArray(6);
+    jintArray arr = env->NewIntArray(10);
     if (!arr)
         return nullptr;
-    env->SetIntArrayRegion(arr, 0, 6, data);
+    env->SetIntArrayRegion(arr, 0, 10, data);
     return arr;
 }
 

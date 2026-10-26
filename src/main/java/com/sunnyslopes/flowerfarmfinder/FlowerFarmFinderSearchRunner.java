@@ -3,6 +3,7 @@ package com.sunnyslopes.flowerfarmfinder;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -41,7 +42,7 @@ public class FlowerFarmFinderSearchRunner {
     public static final int FLOWER_LONG_MAX = 1024;
     public static final int FLOWER_LONG_DEFAULT = 640;
     public static final int FLOWER_SHORT_DEFAULT = 320;
-    public static final int FLOWER_VIEW_DEFAULT = 20;
+    public static final int FLOWER_VIEW_DEFAULT = 10;
     /** Passed through to native CTS. 4 enables full-window verification; 16 keeps the boundary screen. */
     public static final int FLOWER_FRAME_STEP_FAST = 16;
     public static final int FLOWER_FRAME_STEP_PRECISE = 4;
@@ -63,7 +64,7 @@ public class FlowerFarmFinderSearchRunner {
 
     /**
      * @param done when true, search has finished (success, stop, or error); UI should re-enable controls.
-     * @param nativePauseSettled when {@code true}, native pause has taken effect (from {@link FlowerFarmFinderBridge#getSearchProgress()}).
+     * @param nativePauseSettled when {@code true}, native pause has taken effect (progress stopped moving for a grace period).
      * @param nativeStopRequested native stop flag is set (search may still be winding down until {@code done}).
      */
     public record ProgressInfo(int phase, long processed, long total, double percentage, long elapsedMs, long remainingMs,
@@ -93,28 +94,6 @@ public class FlowerFarmFinderSearchRunner {
             double pct = t > 0 ? (p * 100.0 / t) : 100.0;
             return new ProgressInfo(0, p, t, pct, elapsedMs, 0, 0, 0, true, false, false, false);
         }
-    }
-
-    /**
-     * Whether native code has finished winding down into pause (async pause). Uses {@link FlowerFarmFinderBridge#getSearchProgress()}.
-     */
-    public static boolean isNativePauseSettled(int[] progress) {
-        if (progress == null || progress.length < 4) {
-            return false;
-        }
-        boolean tryPause = progress.length > 4 && progress[4] != 0;
-        if (!tryPause) {
-            return false;
-        }
-        int phase = progress[2];
-        int status = progress[3];
-        if (phase == 0 || phase == 1) {
-            return status == 1;
-        }
-        if (phase == 2) {
-            return true;
-        }
-        return true;
     }
 
     private static final Object NATIVE_LOCK = new Object();
@@ -233,7 +212,11 @@ public class FlowerFarmFinderSearchRunner {
         totalPausedMs = 0;
         pauseStartMs = 0;
         runStartTimeMs = System.currentTimeMillis();
-        int threads = Math.max(1, Math.min(threadCount, Runtime.getRuntime().availableProcessors()));
+        int cores = Runtime.getRuntime().availableProcessors();
+        int threads = (threadCount <= 0) ? cores : Math.min(threadCount, cores);
+        if (threads < 1) {
+            threads = 1;
+        }
         long searchWidth = (long) (maxX - minX) + 1;
         long searchHeight = (long) (maxZ - minZ) + 1;
         long searchArea = searchWidth * searchHeight;
@@ -252,6 +235,9 @@ public class FlowerFarmFinderSearchRunner {
         AtomicLong lastProcessed = new AtomicLong(0);
         AtomicLong lastTotal = new AtomicLong(0);
         AtomicLong phase2StartElapsedMs = new AtomicLong(-1L);
+        AtomicLong lastProgressWallMs = new AtomicLong(System.currentTimeMillis());
+        AtomicLong lastCurSeen = new AtomicLong(Long.MIN_VALUE);
+        AtomicInteger lastPhaseSeen = new AtomicInteger(Integer.MIN_VALUE);
         ScheduledExecutorService progressScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "flower-farm-progress");
             t.setDaemon(true);
@@ -267,7 +253,7 @@ public class FlowerFarmFinderSearchRunner {
                     return;
                 }
                 boolean tryStop = arr.length > 5 && arr[5] != 0;
-                boolean pauseSettled = isNativePauseSettled(arr);
+                boolean tryPause = arr.length > 4 && arr[4] != 0;
                 int cur = arr[0];
                 int tot = arr[1];
                 int nPhase = arr[2];
@@ -275,6 +261,16 @@ public class FlowerFarmFinderSearchRunner {
                 if (tot <= 0) {
                     return;
                 }
+                long now = System.currentTimeMillis();
+                if (nPhase != lastPhaseSeen.get() || cur != lastCurSeen.get()) {
+                    lastPhaseSeen.set(nPhase);
+                    lastCurSeen.set(cur);
+                    lastProgressWallMs.set(now);
+                }
+                // Native pause takes effect at its next checkpoint. Treat the
+                // search as paused once progress has not moved for a short grace
+                // period, instead of claiming it immediately.
+                boolean pauseSettled = tryPause && (now - lastProgressWallMs.get() >= 300L);
                 if (nPhase == 2) {
                     phase2StartElapsedMs.compareAndSet(-1L, elapsed);
                 }
