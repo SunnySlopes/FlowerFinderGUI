@@ -38,9 +38,9 @@ gcc -std=c17 -O3 %CDEF% -c "%CUB%\generator.c" "%CUB%\layers.c" "%CUB%\biomenois
 if errorlevel 1 exit /b 1
 gcc -std=c17 -O3 -fopenmp -I"%CTS%" -I"%CUB%" -c "%CTS%\climate.c" "%CTS%\engine.c" "%CTS%\biome.c"
 if errorlevel 1 exit /b 1
-g++ -std=c++20 -O3 %CXXDEF% -c FlowerFarmSearch.cpp
+g++ -std=c++20 -O3 -fopenmp %CXXDEF% -c FlowerFarmSearch.cpp
 if errorlevel 1 exit /b 1
-g++ -std=c++20 -O3 %CXXDEF% -c native/jni/com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge.cpp -o bridge.o
+g++ -std=c++20 -O3 -fopenmp %CXXDEF% -c native/jni/com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge.cpp -o bridge.o
 if errorlevel 1 exit /b 1
 g++ -shared -O3 -fopenmp -o "%OUT%\libFlowerFarmFinderLibJ.dll" generator.o layers.o biomenoise.o biomes.o noise.o util.o climate.o engine.o biome.o FlowerFarmSearch.o bridge.o -static -static-libgcc -static-libstdc++ -pthread
 if errorlevel 1 exit /b 1

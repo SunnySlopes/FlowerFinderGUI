@@ -2,12 +2,17 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define BCACHE_SLOTS (1u << 20)
 static _Atomic uint64_t bcache_key[BCACHE_SLOTS];
 static _Atomic int bcache_val[BCACHE_SLOTS];
-static _Atomic uint64_t bcache_hits;
-static _Atomic uint64_t bcache_misses;
+/* Per-thread hit/miss counters.  They are diagnostics only; keeping them in
+ * shared atomics turned every cache lookup into a cache-line ping-pong
+ * between the (parallel) verification threads. */
+static _Thread_local uint64_t bcache_hits;
+static _Thread_local uint64_t bcache_misses;
 
 static uint64_t splitmix64(uint64_t x)
 {
@@ -27,6 +32,35 @@ static uint64_t bcache_hash(const Generator *g, int x, int y, int z)
     return splitmix64(h);
 }
 
+/* Same value as cubiomes getBiomeAt(g, 1, x, y, z), but without the
+ * calloc/free per query: a 1x1x1 scale-1 sample needs 1 result int plus a
+ * 3x3x3 voronoi source (28 ints for every version this tool supports), so a
+ * small stack buffer covers the common case.  Verification performs tens of
+ * thousands of these lookups per candidate. */
+#define BIOME_SCRATCH_INTS 64
+static int biome_sample_uncached(const Generator *g, int x, int y, int z)
+{
+    Range r = {1, x, z, 1, 1, y, 1};
+    size_t len = getMinCacheSize(g, 1, 1, 1, 1);
+    int local[BIOME_SCRATCH_INTS];
+    int *buf = local;
+    int id;
+    if (len == 0 || len > (size_t)BIOME_SCRATCH_INTS) {
+        buf = (int *)calloc(len ? len : 1, sizeof(int));
+        if (!buf) return none;
+    } else {
+        memset(local, 0, len * sizeof(int));
+    }
+    id = genBiomes(g, buf, r);
+    if (id == 0)
+        id = buf[0];
+    else
+        id = none;
+    if (buf != local)
+        free(buf);
+    return id;
+}
+
 int biome_at_cached(const Generator *g, int x, int y, int z)
 {
     uint64_t h = bcache_hash(g, x, y, z);
@@ -35,24 +69,23 @@ int biome_at_cached(const Generator *g, int x, int y, int z)
     uint64_t k = atomic_load_explicit(&bcache_key[idx], memory_order_acquire);
     int v;
     if (k == tag) {
-        atomic_fetch_add_explicit(&bcache_hits, 1, memory_order_relaxed);
+        bcache_hits++;
         return atomic_load_explicit(&bcache_val[idx], memory_order_relaxed);
     }
-    atomic_fetch_add_explicit(&bcache_misses, 1, memory_order_relaxed);
-    v = getBiomeAt(g, 1, x, y, z);
+    bcache_misses++;
+    v = biome_sample_uncached(g, x, y, z);
     atomic_store_explicit(&bcache_val[idx], v, memory_order_relaxed);
     atomic_store_explicit(&bcache_key[idx], tag, memory_order_release);
     return v;
 }
 
+/* Per-thread counters; call from the thread whose lookups are being measured.
+ * Kept for debugging only (the GUI does not report cache statistics). */
 void biome_cache_stats(uint64_t *hits, uint64_t *misses)
 {
-    if (hits) *hits = atomic_load_explicit(&bcache_hits, memory_order_relaxed);
-    if (misses) *misses = atomic_load_explicit(&bcache_misses, memory_order_relaxed);
+    if (hits) *hits = bcache_hits;
+    if (misses) *misses = bcache_misses;
 }
-
-#include <stdlib.h>
-#include <string.h>
 
 int *biome_map(const Generator *g, int x, int z, int w, int h, int y, int scale)
 {

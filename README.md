@@ -93,17 +93,27 @@ Verified windows are **de-duplicated by window overlap**: after ranking, a windo
 
 ## Search Semantics / 搜索语义
 
-Native search (`flowerSearch`) runs in three phases, in this order:
+Native search (`flowerSearch`) runs in these phases, in this order:
 
-原生搜索（`flowerSearch`）分三个阶段，按此顺序执行：
+原生搜索（`flowerSearch`）按以下阶段执行：
 
-1. **Phase 1** — CTS climate screen (erosion + humidity boxes) over the search area, step 256.
-2. **Phase 2** — Merge/cluster of the screened candidates (no meaningful numeric progress, the UI shows `running`).
-3. **Phase 3** — For each candidate: overworld biome check + flower-noise extremes + nether biome under the window.
+1. **Phase 1** — CTS climate screen: builds the coarse E/H field and sweeps the search area (erosion + humidity boxes). The field rows are part of this phase, so the bar starts at 0 and rises from the first row.
+2. **Phase 2** — Merge/cluster of the screened candidates, reported as "merged candidates processed / candidates to merge" (hit counts, not scan units). The bar starts at 0 when the merge begins.
+3. **Phase 3** — For each candidate: overworld biome check + flower-noise extremes + nether biome under the window. The bar starts at 0 for this phase.
+   Candidates are verified **in parallel** with the same thread count as phase 1, so this phase scales with cores.
 
-1. **阶段 1** — 在搜索区内做 CTS 气候粗筛（侵蚀 + 湿度盒），步进 256。
-2. **阶段 2** — 合并/聚类粗筛得到的候选窗口（没有有效数值进度，界面显示「进行中」）。
-3. **阶段 3** — 对每个候选点做主世界群系校验、花卉噪声极值、以及窗口下方地狱群系。
+1. **阶段 1** — CTS 气候粗筛：构建粗 E/H 气候场并遍历搜索区（侵蚀 + 湿度盒）。粗场行数计入本阶段，因此进度条从 0 开始、从第一行起就推进。
+2. **阶段 2** — 合并/聚类粗筛得到的候选窗口，进度按“已整理候选数 / 待整理候选数”显示（候选计数，不是扫描单位）；开始时从 0 计。
+3. **阶段 3** — 对每个候选点做主世界群系校验、花卉噪声极值、以及窗口下方地狱群系；本阶段同样从 0 开始。
+   候选点使用与阶段 1 相同的线程数**并行**校验，因此该阶段随核心数加速。
+
+Fast mode trades a little completeness for speed: the coarse field uses 128-block cells (precise mode: 64-block) and the window border is sampled every 16 blocks (precise mode: 8). Fast mode can therefore return slightly fewer windows than precise mode.
+
+快速模式用少量完整性换速度：粗气候场使用 128 格（精确模式为 64 格），窗口周界按 16 格采样（精确模式为 8 格），因此快速模式可能比精确模式少返回少量窗口。
+
+Phase 3 usually dominates the runtime (it re-samples a whole window per candidate), so both the thread slider and the CPU matter most there. Results are merged and then sorted with a total order, so the output is identical regardless of thread count.
+
+阶段 3 通常是耗时大头（每个候选都要重采一整个窗口），因此线程数与 CPU 性能主要影响这一阶段。结果先合并再按全序排序，所以输出与线程数无关。
 
 Acceptance highlights:
 
@@ -134,12 +144,12 @@ Result line example / 结果行示例：
 
 ## Features / 功能特点
 
-- Multi-threaded CTS climate + biome search
+- Multi-threaded climate screen **and** candidate verification
 - Pause / resume / stop with live progress and ETA
 - Batch search from seed list files
 - Sort and export results
 
-- 多线程 CTS 气候 + 群系搜索
+- 多线程气候粗筛与候选校验
 - 暂停 / 继续 / 停止，实时进度与剩余时间
 - 种子列表批量搜索
 - 结果排序与导出
@@ -179,10 +189,18 @@ git submodule update --init jni/cubiomes
 ## Notes / 注意事项
 
 - Match thread count to your CPU for stability.
+- Phase 3 (verification) is parallel, so raising the thread count still helps after the climate screen finishes.
+- On load the native library sets `GOMP_SPINCOUNT=0` / `OMP_WAIT_POLICY=passive` unless you already set them. This stops idle OpenMP workers from spinning into the serial tail (sort / de-dup) and the UI; it costs nothing because the search uses only a few long parallel regions.
+- The coarse climate field is counted inside phase 1 (field rows + window sweep), so every phase starts its progress at 0 and no phase ends on a tile-dependent tail.
+- Fast mode may return slightly fewer windows than precise mode (coarser field and border sampling). Use precise mode when completeness matters more than speed.
 - Native libraries (`dll` / `so` / `dylib`) are packaged in the JAR and extracted to a temp directory at runtime.
 - To refresh the Windows native lib: rebuild with `jni/build-jni.bat` (overwrites `native/windows/libFlowerFarmFinderLibJ.dll`).
 
 - 建议按 CPU 能力设置线程数以获得更稳定体验。
+- 阶段 3（候选校验）已并行化，因此气候粗筛结束后提高线程数仍然有效。
+- 原生库加载时会设置 `GOMP_SPINCOUNT=0` / `OMP_WAIT_POLICY=passive`（若你已设置则保留你的值）。这样 OpenMP 空闲线程不会在串行收尾（排序 / 去重）和界面线程上自旋抢 CPU；本搜索只进入少数几个长并行区，关闭自旋几乎没有代价。
+- 粗气候场的工作计入阶段 1（粗场行数 + 窗口扫描），因此每个阶段的进度都从 0 开始，也不会再出现由最慢瓦片决定的阶段尾。
+- 快速模式可能比精确模式少返回少量窗口（粗场与周界采样更粗）。更看重完整性时请使用精确模式。
 - 原生库已打包进 jar，运行时解压到临时目录加载。
 - 更新 Windows native 库：运行 `jni/build-jni.bat`（覆盖 `native/windows/libFlowerFarmFinderLibJ.dll`）。
 

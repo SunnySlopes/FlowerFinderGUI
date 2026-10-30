@@ -114,9 +114,12 @@ int biome_pale_possible(const Climate *c, int qx, int qz, int winx, int winz,
 int biome_pale_actual_possible(const Climate *c, const Generator *g, int qx,
                                int qz, int winx, int winz, int y);
 
-/* Global actual-biome cache, keyed by seed/dim/y/x/z.  Thread-safe. */
+/* Global actual-biome cache, keyed by seed/dim/y/x/z.  Thread-safe and
+ * lock-free; callers may read it from parallel verification workers. */
 int biome_at_cached(const Generator *g, int x, int y, int z);
 int *biome_map(const Generator *g, int x, int z, int w, int h, int y, int scale);
+/* Debug counters for the calling thread only (the cache is shared, but the
+ * counters are thread-local to keep the hot path contention-free). */
 void biome_cache_stats(uint64_t *hits, uint64_t *misses);
 void climate_low_h(const Climate *c, double qx, double qz,
                    double *e_low, double *h);
@@ -170,6 +173,13 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
 
 /* Optional search progress. current/total are plain ints updated atomically. */
 void cts_bind_progress(int *current, int *total);
+
+/* Optional auxiliary sub-phase progress:
+ *   phase 0 (fast mode only) - coarse E/H field rows filled
+ *   phase 2                  - candidate hits merged/clustered
+ * Kept separate from the phase progress so the phase-1 total stays readable
+ * after the sub-phase.  Bind NULL to disable. */
+void cts_bind_aux_progress(int *current, int *total);
 
 /* Optional sub-stage signal. The engine stores 1 while the final merge/cluster
  * tail (after the scan rows finished) is running and 0 otherwise, so hosts can

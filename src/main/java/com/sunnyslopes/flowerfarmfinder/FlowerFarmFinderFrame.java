@@ -2143,19 +2143,19 @@ public class FlowerFarmFinderFrame extends JFrame {
             if (!isSearchRunning) return;
 
             int phase = info.phase();
-            // Phase 2 only merges/clusters the candidate windows and its native
-            // counters still belong to the climate screen, so there is no valid
-            // percentage: show "running" with a moving bar instead.
-            boolean mergePhase = (phase == PHASE_MERGE || phase == -1);
-            searchProgressBar.setIndeterminate(mergePhase);
-            if (!mergePhase) {
+            // Phase 2 now reports its own candidate-hit counters, so it gets a
+            // numeric bar like the other phases; only an unknown phase is shown
+            // as indeterminate.
+            boolean unknownPhase = (phase == -1);
+            searchProgressBar.setIndeterminate(unknownPhase);
+            if (!unknownPhase) {
                 searchProgressBar.setValue((int) Math.min(100, info.percentage()));
             }
             String stageKey = (phase == PHASE_PREPARING) ? "progress.stage0"
-                    : mergePhase ? "progress.stage2"
+                    : (phase == PHASE_MERGE) ? "progress.stage2"
                     : (phase == PHASE_VERIFY) ? "progress.stage3" : "progress.stage1";
-            searchProgressBar.setString(mergePhase
-                    ? getString(stageKey)
+            searchProgressBar.setString(unknownPhase
+                    ? getString(stageKey, 0, 0, 0.0)
                     : getString(stageKey, info.processed(), info.total(), info.percentage()));
 
             searchElapsedTimeLabel.setText(getString("elapsedTime", formatTime(info.elapsedMs())));
@@ -2165,7 +2165,7 @@ public class FlowerFarmFinderFrame extends JFrame {
                         : getString("remainingTime.calculating"));
                 return;
             }
-            if (mergePhase) {
+            if (unknownPhase) {
                 searchRemainingTimeLabel.setText(getString("remainingTime.calculating"));
                 return;
             }
@@ -3130,12 +3130,12 @@ public class FlowerFarmFinderFrame extends JFrame {
                                 return;
                             }
                             if (isListSearchRunning) {
-                                // Phase 2 (merge/cluster) has no valid counters: report "running".
-                                boolean mergePhase = (phase == PHASE_MERGE || phase == -1);
-                                String key = mergePhase ? "currentSeed.stage2"
+                                // Phase 2 reports its own counters (from 0).
+                                boolean unknownPhase = (phase == -1);
+                                String key = (phase == PHASE_MERGE || unknownPhase) ? "currentSeed.stage2"
                                         : (phase == PHASE_VERIFY) ? "currentSeed.stage3" : "currentSeed.stage1";
-                                listSearchCurrentSeedProgressLabel.setText(mergePhase
-                                        ? getString(key, currentSeedIndex, totalSeeds)
+                                listSearchCurrentSeedProgressLabel.setText(unknownPhase
+                                        ? getString(key, currentSeedIndex, totalSeeds, 0, 0, 0.0)
                                         : getString(key, currentSeedIndex, totalSeeds, proc, tot, pct));
                             }
                         });

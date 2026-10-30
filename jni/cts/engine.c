@@ -14,6 +14,15 @@ static int *prog_tot;
 static int *prog_stage;
 static int prog_preset;
 
+/* Auxiliary phase progress for the phase-2 merge/cluster tail, in candidate
+ * hits.  It is a separate pair because the phase-1 total must stay readable
+ * afterwards.  The phase-2 stage is only raised from aux_progress_begin() so
+ * the host never sees phase 2 with counters from another phase. */
+static int *aux_cur;
+static int *aux_tot;
+/* Read by worker threads while the parent enables/disables the sub-phase. */
+static _Atomic int aux_active;   /* merge/cluster ticks enabled */
+
 /* Per-thread depth of tile calls.  Tile scans may run their own merge/cluster;
  * those are still part of the parallel scan and must not flip the global stage. */
 static _Thread_local int tile_depth;
@@ -22,11 +31,52 @@ static CtsControlFn ctl_stopped_fn;
 static CtsControlFn ctl_checkpoint_fn;
 static void *ctl_user;
 
+static void progress_stage_tail(int value);
+
 void cts_bind_progress(int *current, int *total)
 {
     prog_cur = current;
     prog_tot = total;
     prog_preset = 0;
+}
+
+void cts_bind_aux_progress(int *current, int *total)
+{
+    aux_cur = current;
+    aux_tot = total;
+    aux_active = 0;
+}
+
+/* Starts the phase-2 merge/cluster bar: the counters are reset to zero and the
+ * phase-2 stage is raised at the same moment, so the host always sees phase 2
+ * start from 0 with its own units. */
+static void aux_progress_begin(int total)
+{
+    aux_active = 1;
+    if (aux_cur)
+        __atomic_store_n(aux_cur, 0, __ATOMIC_RELAXED);
+    if (aux_tot)
+        __atomic_store_n(aux_tot, total > 0 ? total : 1, __ATOMIC_RELAXED);
+    progress_stage_tail(1);
+}
+
+static void aux_progress_tick(int units)
+{
+    if (aux_active && aux_cur && units > 0)
+        __atomic_add_fetch(aux_cur, units, __ATOMIC_RELAXED);
+}
+
+static void aux_progress_end(void)
+{
+    if (aux_active && aux_cur && aux_tot) {
+        int tot = __atomic_load_n(aux_tot, __ATOMIC_RELAXED);
+        __atomic_store_n(aux_cur, tot, __ATOMIC_RELAXED);
+    }
+    aux_active = 0;
+    /* Hide the counters from the host again (the phase-2 stage ends right after
+     * this), so a late poll can never show stale numbers as phase 2. */
+    if (aux_tot)
+        __atomic_store_n(aux_tot, 0, __ATOMIC_RELAXED);
 }
 
 void cts_bind_stage(int *stage)
@@ -78,19 +128,25 @@ static void progress_expect(int n)
         progress_set_total(n);
 }
 
+/* Adds several progress units at once.  The hot window loops batch their ticks
+ * because every tick is an atomic read-modify-write on one shared counter, and
+ * hundreds of thousands of them from all worker threads serialize on that
+ * cache line.  The phase-2 stage is raised by aux_progress_begin() only, so
+ * phase 1 can never bleed its counters into the merge phase. */
+static void progress_tick_n(int units)
+{
+    if (!prog_cur || units <= 0)
+        return;
+    __atomic_add_fetch(prog_cur, units, __ATOMIC_RELAXED);
+}
+
 static void progress_tick(void)
 {
-    if (prog_cur) {
-        int cur = __atomic_add_fetch(prog_cur, 1, __ATOMIC_RELAXED);
-        /* Once the last scan unit is ticked, every tile has finished scanning and
-         * only merge/cluster work remains: report that tail as a stage. */
-        if (prog_tot) {
-            int tot = __atomic_load_n(prog_tot, __ATOMIC_RELAXED);
-            if (tot > 1 && cur >= tot - 1)
-                progress_stage(1);
-        }
-    }
+    progress_tick_n(1);
 }
+
+/* Tick granularity for the batched scan loops (units, not iterations). */
+#define PROG_TICK_BATCH 512
 
 /* Never leave the UI at 99% after the real work finished. */
 static void progress_finish(void)
@@ -239,9 +295,15 @@ static int cluster_hits(Hit **hits, int *nhits, const ScanCfg *cfg)
 {
     int n = *nhits, m = 0, i, j;
     Hit *out;
-    if (n <= 1 || cfg->cluster <= 0) return 1;
+    if (n <= 1 || cfg->cluster <= 0) {
+        aux_progress_tick(n);
+        return 1;
+    }
     out = (Hit *)malloc((size_t)n * sizeof(Hit));
-    if (!out) return 1;
+    if (!out) {
+        aux_progress_tick(n);
+        return 1;
+    }
     for (i = 0; i < n; i++) {
         const Hit *h = &(*hits)[i];
         int found = -1;
@@ -249,6 +311,7 @@ static int cluster_hits(Hit **hits, int *nhits, const ScanCfg *cfg)
             free(out);
             return 0;
         }
+        aux_progress_tick(1);
         for (j = 0; j < m; j++) {
             if (abs(h->qx - out[j].qx) * 4 <= cfg->cluster &&
                 abs(h->qz - out[j].qz) * 4 <= cfg->cluster) {
@@ -394,6 +457,7 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
     double t0, t1;
     int cap = 0;
     int stopped = 0;
+    int tick_acc = 0;
     memset(st, 0, sizeof(*st));
     *hits = NULL; *nhits = 0;
     if (bx1 <= bx0 || bz1 <= bz0) return 0;
@@ -450,7 +514,11 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
             double emin = 1e30, emax = -1e30, hmin = 1e30, hmax = -1e30;
             int a, b;
             if (((i + j) & 255) == 0 && cts_checkpoint()) { stopped = 1; goto done; }
-            progress_tick();
+            tick_acc++;
+            if (tick_acc >= PROG_TICK_BATCH) {
+                progress_tick_n(tick_acc);
+                tick_acc = 0;
+            }
             if (!bz_ok || bx > qx1 - win) continue;
             for (b = 0; b < ns; b++) {
                 for (a = 0; a < ns; a++) {
@@ -641,13 +709,21 @@ static int screen_area_square(const Climate *c, int64_t bx0, int64_t bz0, int64_
         }
     }
 done:
+    progress_tick_n(tick_acc);
+    tick_acc = 0;
     free(el); free(hh);
     free(ef); free(hf);
     free(l0minE); free(l0maxE); free(l0minH); free(l0maxH);
     progress_stage_tail(1);
-    if (!stopped && cfg->cluster > 0 &&
-        !cluster_hits(hits, nhits, cfg))
-        stopped = 1;
+    if (!stopped && cfg->cluster > 0) {
+        int merge_start = *nhits;
+        if (tile_depth == 0)
+            aux_progress_begin(merge_start);
+        if (!cluster_hits(hits, nhits, cfg))
+            stopped = 1;
+        if (tile_depth == 0)
+            aux_progress_end();
+    }
     if (stopped) {
         free(*hits);
         *hits = NULL;
@@ -710,9 +786,15 @@ static int screen_area_rect(const Climate *c, int64_t bx0, int64_t bz0,
     }
 done:
     progress_stage_tail(1);
-    if (!stopped && cfg->cluster > 0 &&
-        !cluster_hits(hits, nhits, cfg))
-        stopped = 1;
+    if (!stopped && cfg->cluster > 0) {
+        int merge_start = *nhits;
+        if (tile_depth == 0)
+            aux_progress_begin(merge_start);
+        if (!cluster_hits(hits, nhits, cfg))
+            stopped = 1;
+        if (tile_depth == 0)
+            aux_progress_end();
+    }
     if (stopped) {
         free(*hits);
         *hits = NULL;
@@ -735,10 +817,13 @@ static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
                                   Hit **hits, int *nhits, int *cap,
                                   ScanStats *st)
 {
-    int cw = winx / cg, ch = winz / cg;
+    /* Round the window up to whole coarse cells: the sampled rectangle then
+     * covers at least the requested window (a superset), which cannot hide a
+     * window the coarse check would otherwise accept. */
+    int cw = (winx + cg - 1) / cg, ch = (winz + cg - 1) / cg;
     int ow = gw - cw + 1, oh = gh - ch + 1;
     float *mne = NULL, *mxe = NULL, *mnh = NULL, *mxh = NULL;
-    int ix, iz, bx, bz;
+    int ix, iz, bx, bz, tick_acc = 0;
     if (cw <= 0 || ch <= 0 || ow <= 0 || oh <= 0) return 1;
     mne = (float *)malloc((size_t)ow * oh * sizeof(float));
     mxe = (float *)malloc((size_t)ow * oh * sizeof(float));
@@ -763,7 +848,11 @@ static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
                 free(mne); free(mxe); free(mnh); free(mxh);
                 return 0;
             }
-            progress_tick();
+            tick_acc++;
+            if (tick_acc >= PROG_TICK_BATCH) {
+                progress_tick_n(tick_acc);
+                tick_acc = 0;
+            }
             if (!eh_span_ok(mne[k], mxe[k], mnh[k], mxh[k], cfg,
                             m_e + 0.02, m_h + 0.02))
                 continue;
@@ -779,8 +868,28 @@ static int eval_rect_orientation(const Climate *c, const ScanCfg *cfg,
             }
         }
     }
+    progress_tick_n(tick_acc);
     free(mne); free(mxe); free(mnh); free(mxh);
     return 1;
+}
+
+/* Coarse-field cell size in quart for the rectangular screen.  Precise mode
+ * keeps the original 16/8/4/2 ladder (the window extent must be a whole number
+ * of cells).  Fast mode uses a fixed 32 quart (128 block) field: it costs 4x
+ * less to fill and, because the sample grid is sparser, rejects more windows
+ * before the expensive per-candidate checks.  Fast mode rounds the window up
+ * to whole cells, so it is allowed to return a different result set. */
+static int rect_coarse_cell(const ScanCfg *cfg, int winx, int winz)
+{
+    if (!cfg->full_verify)
+        return 32;
+    if (!(winx % 16) && !(winz % 16))
+        return 16;
+    if (!(winx % 8) && !(winz % 8))
+        return 8;
+    if (!(winx % 4) && !(winz % 4))
+        return 4;
+    return 2;
 }
 
 int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
@@ -789,7 +898,7 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
                           Hit **hits_x, int *nhits_x,
                           Hit **hits_z, int *nhits_z, ScanStats *st)
 {
-    int qx0, qx1, qz0, qz1, winx, winz, gw, gh, iz, cg = 16;
+    int qx0, qx1, qz0, qz1, winx, winz, gw, gh, iz, cg;
     float *ef = NULL, *hf = NULL;
     int capx = 0, capz = 0, stepq;
     int stopped = 0;
@@ -803,10 +912,7 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     winx = cfg->window / 4;
     winz = cfg->window_z / 4;
     if (winx <= 0 || winz <= 0 || winx == winz) return 0;
-    if (winx % 16 || winz % 16) cg = 8;
-    if (winx % cg || winz % cg) cg = 4;
-    if (winx % cg || winz % cg) cg = 2;
-    if (winx % cg || winz % cg) return 0;
+    cg = rect_coarse_cell(cfg, winx, winz);
     gw = (qx1 - qx0) / cg + 3;
     gh = (qz1 - qz0) / cg + 3;
     ef = (float *)malloc((size_t)gw * gh * sizeof(float));
@@ -814,6 +920,11 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     if (!ef || !hf) { free(ef); free(hf); return 0; }
     progress_expect(clamp_progress_total(
         (int64_t)rect_both_work(bx0, bz0, bx1, bz1, cfg, step_l0) + 1));
+    /* The coarse field rows are phase-1 units: counting them here means the
+     * phase-1 bar starts at 0 and rises from the first row, with no separate
+     * fill phase whose end would depend on the slowest tile.  There are only a
+     * few hundred rows per tile, so a plain tick per row is cheap and keeps the
+     * bar moving while the field is built. */
 #pragma omp parallel for schedule(static) num_threads(cfg->threads) if(!omp_in_parallel())
     for (iz = 0; iz < gh; iz++) {
         int xx;
@@ -829,6 +940,7 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     }
     if (cts_stopped()) stopped = 1;
     if (stopped) goto done;
+    st->t_fill = now_sec() - t0;
     st->points += (int64_t)gw * gh;
     stepq = (int)(step_l0 / 4 / cg) * cg;
     if (stepq < cg) stepq = cg;
@@ -843,11 +955,15 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     }
 done:
     free(ef); free(hf);
-    progress_stage_tail(1);
     if (!stopped && cfg->cluster > 0) {
+        int merge_start = *nhits_x + *nhits_z;
+        if (tile_depth == 0)
+            aux_progress_begin(merge_start);
         if (!cluster_hits(hits_x, nhits_x, cfg) ||
             !cluster_hits(hits_z, nhits_z, cfg))
             stopped = 1;
+        if (tile_depth == 0)
+            aux_progress_end();
     }
     if (stopped) {
         free(*hits_x); *hits_x = NULL; *nhits_x = 0;
@@ -882,7 +998,7 @@ static int rect_orient_count(int qx0, int qx1, int qz0, int qz1,
 {
     int gw = (qx1 - qx0) / cg + 3;
     int gh = (qz1 - qz0) / cg + 3;
-    int cw = winx / cg, ch = winz / cg;
+    int cw = (winx + cg - 1) / cg, ch = (winz + cg - 1) / cg;
     int64_t nx, nz;
     if (cw <= 0 || ch <= 0 || gw - cw + 1 <= 0 || gh - ch + 1 <= 0)
         return 0;
@@ -895,22 +1011,21 @@ static int rect_orient_count(int qx0, int qx1, int qz0, int qz1,
 static int rect_both_work(int64_t bx0, int64_t bz0, int64_t bx1, int64_t bz1,
                           const ScanCfg *cfg, int64_t step_l0)
 {
-    int qx0, qx1, qz0, qz1, winx, winz, cg = 16, gh, stepq, a, b;
+    int qx0, qx1, qz0, qz1, winx, winz, cg, gh, stepq, a, b;
     if (bx1 <= bx0 || bz1 <= bz0) return 0;
     qx0 = (int)floor_div4(bx0); qz0 = (int)floor_div4(bz0);
     qx1 = (int)floor_div4(bx1 - 1); qz1 = (int)floor_div4(bz1 - 1);
     winx = cfg->window / 4;
     winz = cfg->window_z / 4;
     if (winx <= 0 || winz <= 0 || winx == winz) return 0;
-    if (winx % 16 || winz % 16) cg = 8;
-    if (winx % cg || winz % cg) cg = 4;
-    if (winx % cg || winz % cg) cg = 2;
-    if (winx % cg || winz % cg) return 0;
+    cg = rect_coarse_cell(cfg, winx, winz);
     gh = (qz1 - qz0) / cg + 3;
     stepq = (int)(step_l0 / 4 / cg) * cg;
     if (stepq < cg) stepq = cg;
     a = rect_orient_count(qx0, qx1, qz0, qz1, winx, winz, cg, stepq);
     b = rect_orient_count(qx0, qx1, qz0, qz1, winz, winx, cg, stepq);
+    /* Both modes count the coarse-field rows in phase 1, so the phase-1 bar
+     * starts at 0 and covers the field build plus the window sweep. */
     return clamp_progress_total((int64_t)gh + a + b);
 }
 
@@ -1030,6 +1145,19 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     overlap = (cfg->window > cfg->window_z ? cfg->window : cfg->window_z) + step_l0;
     ntx = (int)ceil(sqrt((double)gridNt));
     ntz = (gridNt + ntx - 1) / ntx;
+    /* Keep every tile at least four halo widths wide; below that the overlap
+     * costs more work than the parallel gain. */
+    {
+        int64_t minSpan = (bx1 - bx0) < (bz1 - bz0) ? (bx1 - bx0) : (bz1 - bz0);
+        int maxTiles = (int)(minSpan / (4 * overlap));
+        if (maxTiles < 1) maxTiles = 1;
+        if (ntx > maxTiles) ntx = maxTiles;
+        if (ntz > maxTiles) ntz = maxTiles;
+    }
+    if (ntx * ntz <= 1)
+        return screen_area_rect_both(c, bx0, bz0, bx1, bz1, cfg, step_l0,
+                                     m_e, m_h, hits_x, nhits_x,
+                                     hits_z, nhits_z, st);
     tw = (bx1 - bx0 + ntx - 1) / ntx;
     th = (bz1 - bz0 + ntz - 1) / ntz;
     tr = (BothTile *)calloc((size_t)ntx * ntz, sizeof(*tr));
@@ -1063,7 +1191,6 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     prog_preset = 0;
     if (cts_stopped())
         goto stopped;
-    progress_stage_tail(1);
     for (t = 0; t < ntx * ntz; t++) {
         if (cfg->cluster > 0) {
             if (!cluster_hits(&tr[t].hx, &tr[t].nx, cfg) ||
@@ -1073,12 +1200,17 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         totalx += tr[t].nx;
         totalz += tr[t].nz;
     }
+    /* The per-tile pass is a quick pre-merge; the global pass is where the
+     * phase-2 time goes, so report the merged candidate count there. */
+    if (cfg->cluster > 0)
+        aux_progress_begin((int)(totalx + totalz));
     ax = (Hit *)malloc((totalx ? totalx : 1) * sizeof(Hit));
     az = (Hit *)malloc((totalz ? totalz : 1) * sizeof(Hit));
     if (!ax || !az) {
         free(ax); free(az);
         for (t = 0; t < ntx * ntz; t++) { free(tr[t].hx); free(tr[t].hz); }
         free(tr);
+        aux_progress_end();
         return screen_area_rect_both(c, bx0, bz0, bx1, bz1, cfg, step_l0,
                                      m_e, m_h, hits_x, nhits_x,
                                      hits_z, nhits_z, st);
@@ -1120,6 +1252,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     }
     if (cts_stopped())
         goto stopped_final;
+    aux_progress_end();
     progress_tick();          /* merge/cluster unit */
     progress_finish();
     progress_stage_tail(0);
@@ -1128,6 +1261,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     return 1;
 
 stopped:
+    aux_progress_end();
     for (t = 0; t < ntx * ntz; t++) { free(tr[t].hx); free(tr[t].hz); }
     free(tr);
     free(ax); free(az);
@@ -1137,6 +1271,7 @@ stopped:
     return 0;
 
 stopped_final:
+    aux_progress_end();
     free(ax); free(az);
     *hits_x = NULL; *nhits_x = 0;
     *hits_z = NULL; *nhits_z = 0;
@@ -1200,9 +1335,21 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
 
     ntx = (int)ceil(sqrt((double)gridNt));
     ntz = (gridNt + ntx - 1) / ntx;
+    overlap = (cfg->window > cfg->window_z ? cfg->window : cfg->window_z) + step_l0;
+    /* Keep every tile at least four halo widths wide; below that the overlap
+     * costs more work than the parallel gain. */
+    {
+        int64_t minSpan = (bx1 - bx0) < (bz1 - bz0) ? (bx1 - bx0) : (bz1 - bz0);
+        int maxTiles = (int)(minSpan / (4 * overlap));
+        if (maxTiles < 1) maxTiles = 1;
+        if (ntx > maxTiles) ntx = maxTiles;
+        if (ntz > maxTiles) ntz = maxTiles;
+    }
+    if (ntx * ntz <= 1)
+        return screen_area(c, bx0, bz0, bx1, bz1, cfg, step_l0, m_e, m_h,
+                           bg, hits, nhits, st);
     tw = (bx1 - bx0 + ntx - 1) / ntx;
     th = (bz1 - bz0 + ntz - 1) / ntz;
-    overlap = (cfg->window > cfg->window_z ? cfg->window : cfg->window_z) + step_l0;
     tr = (TileOut *)calloc((size_t)ntx * ntz, sizeof(*tr));
     if (!tr)
         return screen_area(c, bx0, bz0, bx1, bz1, cfg, step_l0, m_e, m_h,
@@ -1233,17 +1380,20 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     prog_preset = 0;
     if (cts_stopped())
         goto stopped;
-    progress_stage_tail(1);
     for (t = 0; t < ntx * ntz; t++) {
-        if (cfg->cluster > 0 &&
-            !cluster_hits(&tr[t].hits, &tr[t].nhits, cfg))
+        if (cfg->cluster > 0 && !cluster_hits(&tr[t].hits, &tr[t].nhits, cfg))
             goto stopped;
         total += tr[t].nhits;
     }
+    /* The per-tile pass is a quick pre-merge; the global pass is where the
+     * phase-2 time goes, so report the merged candidate count there. */
+    if (cfg->cluster > 0)
+        aux_progress_begin((int) total);
     all = (Hit *)malloc((total ? total : 1) * sizeof(Hit));
     if (!all) {
         for (t = 0; t < ntx * ntz; t++) free(tr[t].hits);
         free(tr);
+        aux_progress_end();
         return screen_area(c, bx0, bz0, bx1, bz1, cfg, step_l0, m_e, m_h,
                            bg, hits, nhits, st);
     }
@@ -1277,6 +1427,7 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         goto stopped_final;
     if (cts_stopped())
         goto stopped_final;
+    aux_progress_end();
     progress_tick();          /* merge/cluster unit */
     progress_finish();
     progress_stage_tail(0);
@@ -1284,6 +1435,7 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
     return 1;
 
 stopped:
+    aux_progress_end();
     for (t = 0; t < ntx * ntz; t++) free(tr[t].hits);
     free(tr);
     free(all);
@@ -1292,9 +1444,9 @@ stopped:
     return 0;
 
 stopped_final:
+    aux_progress_end();
     free(all);
     *hits = NULL; *nhits = 0;
     progress_stage_tail(0);
     return 0;
 }
-

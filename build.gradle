@@ -44,6 +44,8 @@ tasks.withType(JavaCompile).configureEach {
 // 否则后执行的任务会盖掉带 Main-Class 的包。
 jar {
     archiveBaseName.set('FlowerFarmFinder')
+    // 同一份资源（源集输出 + processResources 输出）只允许写一次
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest {
         attributes 'Main-Class': mainClassName
         attributes 'Multi-Release': 'true'
@@ -54,6 +56,7 @@ jar {
 shadowJar {
     archiveBaseName.set('FlowerFarmFinder')
     archiveClassifier.set('')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     mergeServiceFiles()
     manifest {
         attributes 'Main-Class': mainClassName
@@ -69,6 +72,8 @@ tasks.register('buildMainJar', ShadowJar) {
     archiveClassifier.set('')
     from sourceSets.main.output
     configurations = [project.configurations.runtimeClasspath]
+    // 同一份资源（源集输出 + processResources 输出）只允许写一次
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest {
         attributes 'Main-Class': mainClassName
         attributes 'Multi-Release': 'true'

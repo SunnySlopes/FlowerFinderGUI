@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -66,6 +67,7 @@ struct CtsBinding {
         cts_bind_control(nullptr, nullptr, nullptr);
         cts_bind_stage(nullptr);
         cts_bind_progress(nullptr, nullptr);
+        cts_bind_aux_progress(nullptr, nullptr);
     }
     FlowerSearchControl &control;
 };
@@ -136,7 +138,11 @@ ScanCfg makeCfg(int windowX, int windowZ, int fullVerify, int noPale, int cluste
     cfg.l1_boundary = 0;
     cfg.e_first = 1;
     cfg.perimeter = 0;
-    cfg.perimeter_step = 2;
+    /* Fast mode with a rectangular window samples the border every 16 blocks
+     * instead of 8: the perimeter is the dominant cost for large windows
+     * (960x640), and the coarser border only drops a few marginal windows.
+     * Square windows keep the original 8-block border. */
+    cfg.perimeter_step = (fullVerify || windowX == windowZ) ? 2 : 4;
     cfg.pm_e = 0.02;
     cfg.pm_h = 0.02;
     cfg.full_verify = fullVerify ? 1 : 0;
@@ -367,6 +373,38 @@ struct FlowerNoise {
     PerlinNoise oct[4]{};
 };
 
+/**
+ * Reusable per-thread buffers for considerHit().  Verification runs in
+ * parallel over candidates, so keeping these vectors out of the per-candidate
+ * heap churn both avoids malloc contention and keeps the sampled window data
+ * hot in each worker's caches.  One instance per worker thread.
+ */
+struct VerifyScratch {
+    std::vector<int> flowerX, flowerZ;
+    std::vector<int> centreX, centreZ;
+    std::vector<int> sampleX, sampleZ;
+
+    VerifyScratch()
+    {
+        flowerX.reserve(1024);
+        flowerZ.reserve(1024);
+        centreX.reserve(1024);
+        centreZ.reserve(1024);
+        sampleX.reserve(512);
+        sampleZ.reserve(512);
+    }
+
+    void reset()
+    {
+        flowerX.clear();
+        flowerZ.clear();
+        centreX.clear();
+        centreZ.clear();
+        sampleX.clear();
+        sampleZ.clear();
+    }
+};
+
 void initFlowerNoise(FlowerNoise &fn)
 {
     Xoroshiro xr;
@@ -448,7 +486,7 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
                  const FlowerNoise &flowers, int mc, const VersionRules &rules, const Hit &hit,
                  int winxBlocks, int winzBlocks, char orient, int order,
                  FlowerSearchControl &control, const FlowerSearchOptions &options,
-                 OutRow &row, bool &accepted)
+                 VerifyScratch &scratch, OutRow &row, bool &accepted)
 {
     accepted = false;
     if (!pauseOk(control))
@@ -489,12 +527,11 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
 
     const int wx = hit.qx * 4;
     const int wz = hit.qz * 4;
-    std::vector<int> flowerX;
-    std::vector<int> flowerZ;
+    scratch.reset();
+    std::vector<int> &flowerX = scratch.flowerX;
+    std::vector<int> &flowerZ = scratch.flowerZ;
     int paleCells = 0, swampCells = 0;
     int birchCells = 0, oldCells = 0, meadowCells = 0, cherryCells = 0;
-    flowerX.reserve(256);
-    flowerZ.reserve(256);
     for (int qz = 0; qz < winz; qz++)
     {
         for (int qx = 0; qx < winx; qx++)
@@ -539,10 +576,8 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
         centre.minZ = wz + margin;
         centre.maxZ = wz + winzBlocks - 1 - margin;
     }
-    std::vector<int> centreX;
-    std::vector<int> centreZ;
-    centreX.reserve(flowerX.size());
-    centreZ.reserve(flowerZ.size());
+    std::vector<int> &centreX = scratch.centreX;
+    std::vector<int> &centreZ = scratch.centreZ;
     for (size_t i = 0; i < flowerX.size(); i++)
     {
         if (centre.active && !centre.contains(flowerX[i], flowerZ[i]))
@@ -552,10 +587,8 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
     }
     const int cap = 512;
     const int stride = std::max(1, ((int) centreX.size() + cap - 1) / cap);
-    std::vector<int> sampleX;
-    std::vector<int> sampleZ;
-    sampleX.reserve((size_t) std::min((int) centreX.size(), cap));
-    sampleZ.reserve(sampleX.capacity());
+    std::vector<int> &sampleX = scratch.sampleX;
+    std::vector<int> &sampleZ = scratch.sampleZ;
     for (size_t i = 0; i < centreX.size(); i += (size_t) stride)
     {
         sampleX.push_back(centreX[i]);
@@ -671,6 +704,10 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     setPhase(control, 1, 1);
     setOverall(control, 0, 0);
     cts_bind_progress(reinterpret_cast<int *>(control.current), reinterpret_cast<int *>(control.total));
+    /* The merge/cluster tail reports candidate hits on its own counters so the
+     * phase-1 total above stays intact for the overall progress. */
+    cts_bind_aux_progress(reinterpret_cast<int *>(control.auxCurrent),
+                            reinterpret_cast<int *>(control.auxTotal));
 
     Hit *hits = nullptr;
     Hit *hitsZ = nullptr;
@@ -690,6 +727,7 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
             kMarginE, kMarginH, kBg, threads, &hits, &nHits, &stats);
     }
     cts_bind_progress(nullptr, nullptr);
+    cts_bind_aux_progress(nullptr, nullptr);
     if (!screened || !pauseOk(control))
     {
         std::free(hits);
@@ -722,47 +760,92 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     FlowerNoise flowers;
     initFlowerNoise(flowers);
 
-    std::vector<OutRow> rows;
-    rows.reserve((size_t) std::min(candidateCount, 4096));
-    int done = 0;
-    bool keep = true;
-    auto take = [&](const Hit &hit, int winx, int winz, char orient, int order) {
-        if (!keep)
-            return;
-        OutRow row;
-        bool accepted = false;
-        keep = considerHit(climate, overworld, nether, flowers, mc, rules, hit, winx, winz, orient, order,
-                           control, options, row, accepted);
-        if (keep && accepted)
-            rows.push_back(std::move(row));
-        done++;
-        setPhaseCurrent(control, done);
-        setOverall(control, phase1Total + done, overallTotal);
+    /* Phase 3 is the expensive part: every candidate re-samples a full window
+     * of biomes plus the flower-noise height extremes.  All inputs here are
+     * read-only (Climate / Generator / FlowerNoise), and the only shared state
+     * is either atomic (biome cache, progress counters, pause/stop flags) or
+     * collected per thread, so candidates can be verified in parallel.
+     * Results are merged under one critical section and then sorted with a
+     * total order (rowPreferred ends on the unique candidate ordinal), so the
+     * final list does not depend on which worker finished first. */
+    struct VerifyTask {
+        const Hit *hit;
+        int winx, winz;
+        char orient;
+        int order;
     };
-
+    std::vector<VerifyTask> tasks;
+    tasks.reserve((size_t) std::min(candidateCount, 65536));
     if (dual)
     {
         const char orientX = windowX >= windowZ ? 'X' : 'Z';
         const char orientZ = orientX == 'X' ? 'Z' : 'X';
         if (useXList)
         {
-            for (int i = 0; i < nHits && keep; i++)
-                take(hits[i], windowX, windowZ, orientX, i);
+            for (int i = 0; i < nHits; i++)
+                tasks.push_back({&hits[i], windowX, windowZ, orientX, i});
         }
         if (useZList)
         {
-            for (int i = 0; i < nHitsZ && keep; i++)
-                take(hitsZ[i], windowZ, windowX, orientZ, nHits + i);
+            for (int i = 0; i < nHitsZ; i++)
+                tasks.push_back({&hitsZ[i], windowZ, windowX, orientZ, nHits + i});
         }
     }
     else
     {
-        for (int i = 0; i < nHits && keep; i++)
-            take(hits[i], windowX, windowZ, 0, i);
+        for (int i = 0; i < nHits; i++)
+            tasks.push_back({&hits[i], windowX, windowZ, 0, i});
+    }
+
+    std::vector<OutRow> rows;
+    rows.reserve((size_t) std::min(candidateCount, 4096));
+    const int taskCount = (int) tasks.size();
+    const int verifyThreads = std::max(1, std::min(threads, taskCount));
+    std::atomic<bool> keep{true};
+    std::atomic<int> verified{0};
+    if (taskCount > 0)
+    {
+#pragma omp parallel num_threads(verifyThreads)
+        {
+            std::vector<OutRow> local;
+            local.reserve(64);
+            VerifyScratch scratch;
+#pragma omp for schedule(dynamic, 1)
+            for (int i = 0; i < taskCount; i++)
+            {
+                if (!keep.load(std::memory_order_relaxed))
+                    continue;
+                const VerifyTask &task = tasks[(size_t) i];
+                OutRow row;
+                bool accepted = false;
+                if (!considerHit(climate, overworld, nether, flowers, mc, rules, *task.hit,
+                                 task.winx, task.winz, task.orient, task.order, control,
+                                 options, scratch, row, accepted))
+                {
+                    keep.store(false, std::memory_order_relaxed);
+                    continue;
+                }
+                if (accepted)
+                    local.push_back(std::move(row));
+                const int n = verified.fetch_add(1, std::memory_order_relaxed) + 1;
+                /* The UI polls at ~100 ms; per-candidate atomic stores from
+                 * every worker are pure contention. */
+                if ((n & 15) == 0)
+                {
+                    setPhaseCurrent(control, n);
+                    setOverall(control, phase1Total + n, overallTotal);
+                }
+            }
+#pragma omp critical(fff_verify_merge)
+            {
+                rows.insert(rows.end(), std::make_move_iterator(local.begin()),
+                            std::make_move_iterator(local.end()));
+            }
+        }
     }
     std::free(hits);
     std::free(hitsZ);
-    if (!keep)
+    if (!keep.load())
         return result;
 
     /* Candidates are done; keep one phase-3 unit for the finalize step. */

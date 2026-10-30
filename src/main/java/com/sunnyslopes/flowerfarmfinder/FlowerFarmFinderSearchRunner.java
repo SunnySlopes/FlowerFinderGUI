@@ -265,7 +265,8 @@ public class FlowerFarmFinderSearchRunner {
 
         AtomicLong lastProcessed = new AtomicLong(0);
         AtomicLong lastTotal = new AtomicLong(0);
-        AtomicLong verifyStartElapsedMs = new AtomicLong(-1L);
+        AtomicInteger etaPhase = new AtomicInteger(Integer.MIN_VALUE);
+        AtomicLong etaPhaseStartElapsedMs = new AtomicLong(0L);
         AtomicLong lastProgressWallMs = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCurSeen = new AtomicLong(Long.MIN_VALUE);
         AtomicInteger lastPhaseSeen = new AtomicInteger(Integer.MIN_VALUE);
@@ -288,6 +289,18 @@ public class FlowerFarmFinderSearchRunner {
                 int cur = arr[0];
                 int tot = arr[1];
                 int nPhase = arr[2];
+                // Phase 2 (merge/cluster) publishes its own unit counts; use them
+                // so the bar starts at 0 for that phase.  While the counters are
+                // not published yet, keep the previous frame instead of showing
+                // numbers that belong to another phase.
+                if (nPhase == PHASE_MERGE) {
+                    if (arr.length >= 12 && arr[11] > 0) {
+                        cur = arr[10];
+                        tot = arr[11];
+                    } else {
+                        return;
+                    }
+                }
                 long elapsed = getElapsedMs();
                 if (tot <= 0) {
                     return;
@@ -302,17 +315,17 @@ public class FlowerFarmFinderSearchRunner {
                 // search as paused once progress has not moved for a short grace
                 // period, instead of claiming it immediately.
                 boolean pauseSettled = tryPause && (now - lastProgressWallMs.get() >= 300L);
-                if (nPhase == PHASE_VERIFY) {
-                    verifyStartElapsedMs.compareAndSet(-1L, elapsed);
+                // ETA is measured from the moment this phase was first observed,
+                // so phase 1 and phase 2 do not inherit an unrelated start time.
+                if (nPhase != etaPhase.get()) {
+                    etaPhase.set(nPhase);
+                    etaPhaseStartElapsedMs.set(elapsed);
                 }
-                long phaseStart = nPhase == PHASE_VERIFY ? verifyStartElapsedMs.get() : 0L;
-                long phaseElapsed = Math.max(0L, elapsed - Math.max(0L, phaseStart));
+                long phaseElapsed = Math.max(0L, elapsed - etaPhaseStartElapsedMs.get());
                 lastProcessed.set(cur);
                 lastTotal.set(tot);
                 long remaining = 0L;
-                // Phase 2 (merge/cluster) reports the climate-screen counters, which
-                // no longer describe its own work, so it gets no estimate.
-                if (nPhase != PHASE_MERGE && !isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
+                if (!isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
                     double eta = phaseElapsed * ((double) (tot - cur) / (double) cur);
                     if (eta > 0 && eta < (double) Long.MAX_VALUE) {
                         remaining = (long) eta;

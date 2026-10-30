@@ -30,6 +30,14 @@ struct FlowerSearchControl {
     std::atomic_int *overallCurrent = nullptr;
     std::atomic_int *overallTotal = nullptr;
     std::atomic_int *stage = nullptr;
+    /**
+     * Auxiliary sub-phase progress: phase-0 coarse-field rows (fast mode only)
+     * and phase-2 merged candidate hits.  Separate from current/total so the
+     * phase-1 total is still readable after the sub-phase.  Optional; nullptr
+     * disables it.
+     */
+    std::atomic_int *auxCurrent = nullptr;
+    std::atomic_int *auxTotal = nullptr;
 };
 
 /**
