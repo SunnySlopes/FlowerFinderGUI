@@ -74,17 +74,36 @@ Long side must be **256～1024**. Short side (when enabled) must be ≤ long sid
 
 长边须为 **256～1024**；启用短边时须 ≤ 长边。
 
+## Optional Filters / 筛选条件
+
+Both tabs have four optional filters (off by default):
+
+两个标签页都有四个可选筛选条件（默认关闭）：
+
+| Filter / 选项 | Behaviour / 行为 |
+|---|---|
+| **Both wildflowers** / **两种野花** | Keep only windows whose bonus contains both `wildflowers` (birch/meadow) and `pink_petals` (cherry). Disabled on `1.18~1.21.3`, which has no wildflower bonus. / 只保留同时含 `wildflowers`（白桦/草甸）与 `pink_petals`（樱花）的窗口；`1.18~1.21.3` 无野花加分，该项禁用。 |
+| **Nether contains basalt deltas** / **地狱含玄武岩三角洲** | Keep only windows whose nether counterpart contains basalt deltas. / 只保留对应下界窗口含玄武岩三角洲的窗口。 |
+| **Require horizontal/vertical** / **要求横向/竖向** | Horizontal keeps `sideX ≥ sideZ`; vertical keeps `sideZ ≥ sideX`. Square windows satisfy both. / 横向只保留 X 跨度 ≥ Z 跨度；竖向只保留 Z 跨度 ≥ X 跨度；正方形窗口两者都满足。 |
+| **Flower forest edge distance** / **繁花森林离边距离** | Off by default, distance field `0`. When checked and filled, both flower-gradient ends (dandelion / lily of the valley) must lie inside the window centre — at least that many blocks from every edge of the demand window. / 默认不勾选，距离填 `0`。勾选并填写后，繁花的 2 个花梯度极端（蒲公英/铃兰）都须落在中心区内，即距要求区域四边均不小于该距离。 |
+
+Verified windows are **de-duplicated by window overlap**: after ranking, a window that intersects an already-kept window is dropped, so every returned result occupies a disjoint area.
+
+校验通过的窗口按**窗口是否重叠**去重：排序后，与已保留窗口相交的窗口会被丢弃，因此返回的窗口互不重叠。
+
 ## Search Semantics / 搜索语义
 
-Native search (`flowerSearch`) runs in two phases:
+Native search (`flowerSearch`) runs in three phases, in this order:
 
-原生搜索（`flowerSearch`）分两阶段：
+原生搜索（`flowerSearch`）分三个阶段，按此顺序执行：
 
 1. **Phase 1** — CTS climate screen (erosion + humidity boxes) over the search area, step 256.
-2. **Phase 2** — For each hit: overworld biome check + flower-noise extremes + nether biome under the window.
+2. **Phase 2** — Merge/cluster of the screened candidates (no meaningful numeric progress, the UI shows `running`).
+3. **Phase 3** — For each candidate: overworld biome check + flower-noise extremes + nether biome under the window.
 
 1. **阶段 1** — 在搜索区内做 CTS 气候粗筛（侵蚀 + 湿度盒），步进 256。
-2. **阶段 2** — 对候选点做主世界群系校验、花卉噪声极值、以及窗口下方地狱群系。
+2. **阶段 2** — 合并/聚类粗筛得到的候选窗口（没有有效数值进度，界面显示「进行中」）。
+3. **阶段 3** — 对每个候选点做主世界群系校验、花卉噪声极值、以及窗口下方地狱群系。
 
 Acceptance highlights:
 
@@ -93,11 +112,13 @@ Acceptance highlights:
 - Window must contain **flower forest** + **swamp**; on `1.21.4+` also **pale garden**.
 - `flowerArea` must be **> 2000** (4×4 cells × 16).
 - Flower noise must have both gradient ends (dandelion / lily of the valley) within **32** vertical blocks.
+- With **Flower forest edge distance** set, both gradient ends must also sit in the window centre (≥ distance from every edge).
 - Score prefers pink petals, then basalt deltas / wood bonus / cherry, then closer to world origin.
 
 - 窗口须含**花林** + **沼泽**；`1.21.4+` 还须含**苍白花园**。
 - `flowerArea` 须 **> 2000**（4×4 格 × 16）。
 - 花卉噪声须在竖直 **32** 格内同时出现两端（蒲公英 / 铃兰）。
+- 勾选**繁花森林离边距离**时，两端还须落在窗口中心区内（距四边均 ≥ 该距离）。
 - 排序优先樱花粉瓣，其次玄武岩三角洲 / 木材加分 / 樱花，再按距出生点更近。
 
 Result line example / 结果行示例：

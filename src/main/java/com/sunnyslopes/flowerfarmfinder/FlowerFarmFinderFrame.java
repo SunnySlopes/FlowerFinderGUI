@@ -25,6 +25,13 @@ import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.LIST
 import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.LIST_RANGE_SIDE_LEGACY;
 import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.SEARCH_RANGE_SIDE_LATEST;
 import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.SEARCH_RANGE_SIDE_LEGACY;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.FILTER_ORIENTATION_ANY;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.FILTER_ORIENTATION_HORIZONTAL;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.FILTER_ORIENTATION_VERTICAL;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.FLOWER_CENTER_MARGIN_DEFAULT;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.PHASE_MERGE;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.PHASE_PREPARING;
+import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.PHASE_VERIFY;
 import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.SUPPORTED_MC_VERSIONS;
 import static com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderSearchRunner.isLatestMcRange;
 
@@ -44,6 +51,12 @@ public class FlowerFarmFinderFrame extends JFrame {
     private JLabel searchShortSideLabel;
     private JLabel searchViewDistanceLabel;
     private JCheckBox searchFastModeCheckBox;
+    private JCheckBox searchBothWildflowersCheckBox;
+    private JCheckBox searchBasaltCheckBox;
+    private JCheckBox searchOrientationCheckBox;
+    private JComboBox<String> searchOrientationComboBox;
+    private JCheckBox searchFlowerCenterCheckBox;
+    private JTextField searchFlowerCenterField;
     private JLabel searchMcVersionLabel;
     private JComboBox<String> searchMcVersionComboBox;
     private JLabel searchMinXLabel;
@@ -107,6 +120,12 @@ public class FlowerFarmFinderFrame extends JFrame {
     private JLabel listShortSideLabel;
     private JLabel listViewDistanceLabel;
     private JCheckBox listFastModeCheckBox;
+    private JCheckBox listBothWildflowersCheckBox;
+    private JCheckBox listBasaltCheckBox;
+    private JCheckBox listOrientationCheckBox;
+    private JComboBox<String> listOrientationComboBox;
+    private JCheckBox listFlowerCenterCheckBox;
+    private JTextField listFlowerCenterField;
     private JLabel listMcVersionLabel;
     private JComboBox<String> listMcVersionComboBox;
     private JLabel listSearchMinXLabel;
@@ -207,6 +226,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         sb.append(getString("hint.softReq")).append("<br>");
         sb.append(getString("hint.samplingY")).append("<br>");
         sb.append(getString("hint.fastModeNote")).append("<br>");
+        sb.append(getString("hint.filters")).append("<br>");
         sb.append(getString("hint.outputHint"));
         return sb.toString();
     }
@@ -249,6 +269,133 @@ public class FlowerFarmFinderFrame extends JFrame {
 
     private boolean isListFastMode() {
         return listFastModeCheckBox == null || listFastModeCheckBox.isSelected();
+    }
+
+    /** Optional filters: both wildflower bonuses in the same window. */
+    private boolean isBothWildflowersFilter(JCheckBox box) {
+        return box != null && box.isSelected();
+    }
+
+    /** Optional filters: nether window contains basalt deltas. */
+    private boolean isBasaltFilter(JCheckBox box) {
+        return box != null && box.isSelected();
+    }
+
+    /** Orientation filter: 0 any, 1 horizontal (X span >= Z span), 2 vertical (Z span >= X span). */
+    private int selectedOrientation(JCheckBox box, JComboBox<String> combo) {
+        if (box == null || !box.isSelected() || combo == null) {
+            return FILTER_ORIENTATION_ANY;
+        }
+        return combo.getSelectedIndex() == 1 ? FILTER_ORIENTATION_VERTICAL : FILTER_ORIENTATION_HORIZONTAL;
+    }
+
+    /** The axis dropdown is only editable while its checkbox is on and no search runs. */
+    private void applyOrientationEnable(boolean searchTab) {
+        JCheckBox box = searchTab ? searchOrientationCheckBox : listOrientationCheckBox;
+        JComboBox<String> combo = searchTab ? searchOrientationComboBox : listOrientationComboBox;
+        boolean running = searchTab ? isSearchRunning : isListSearchRunning;
+        if (combo != null) {
+            combo.setEnabled(!running && box != null && box.isSelected());
+        }
+    }
+
+    /**
+     * Enable/disable the optional filters. "Both wildflowers" only makes sense on
+     * 1.21.4+ (1.18~1.21.3 has no wildflowers bonus), so it is disabled there.
+     */
+    private void applyFilterEnable(boolean searchTab) {
+        boolean running = searchTab ? isSearchRunning : isListSearchRunning;
+        JComboBox<String> versionCombo = searchTab ? searchMcVersionComboBox : listMcVersionComboBox;
+        boolean latest = isLatestMcRange(selectedMcVersion(versionCombo));
+        JCheckBox both = searchTab ? searchBothWildflowersCheckBox : listBothWildflowersCheckBox;
+        JCheckBox basalt = searchTab ? searchBasaltCheckBox : listBasaltCheckBox;
+        JCheckBox orientation = searchTab ? searchOrientationCheckBox : listOrientationCheckBox;
+        if (both != null) {
+            if (!latest) {
+                both.setSelected(false);
+            }
+            both.setEnabled(!running && latest);
+        }
+        if (basalt != null) {
+            basalt.setEnabled(!running);
+        }
+        if (orientation != null) {
+            orientation.setEnabled(!running);
+        }
+        applyOrientationEnable(searchTab);
+        applyFlowerCenterEnable(searchTab);
+    }
+
+    /**
+     * Flower-forest edge margin: the checkbox is editable whenever no search runs,
+     * the distance field only while the filter is checked.
+     */
+    private void applyFlowerCenterEnable(boolean searchTab) {
+        JCheckBox box = searchTab ? searchFlowerCenterCheckBox : listFlowerCenterCheckBox;
+        JTextField field = searchTab ? searchFlowerCenterField : listFlowerCenterField;
+        boolean running = searchTab ? isSearchRunning : isListSearchRunning;
+        if (box != null) {
+            box.setEnabled(!running);
+        }
+        if (field != null) {
+            field.setEnabled(!running && box != null && box.isSelected());
+        }
+    }
+
+    /**
+     * Reads the flower-forest edge margin.
+     *
+     * @return 0 when the filter is off, the distance in blocks when valid,
+     *     -1 when the value is not a non-negative integer,
+     *     -2 when the distance leaves no centre area inside the demand window.
+     */
+    private int readFlowerCenterMargin(JCheckBox box, JTextField field, int sideX, int sideZ) {
+        if (box == null || !box.isSelected()) {
+            return FLOWER_CENTER_MARGIN_DEFAULT;
+        }
+        if (field == null) {
+            return FLOWER_CENTER_MARGIN_DEFAULT;
+        }
+        int margin;
+        try {
+            margin = Integer.parseInt(field.getText().trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        if (margin < 0) {
+            return -1;
+        }
+        if (margin > (Math.min(sideX, sideZ) - 1) / 2) {
+            return -2;
+        }
+        return margin;
+    }
+
+    /** Reports an invalid flower-forest edge margin; returns false for "no error". */
+    private boolean reportFlowerCenterMarginError(int margin, int sideX, int sideZ) {
+        if (margin == -1) {
+            JOptionPane.showMessageDialog(this, getString("error.flowerCenterInvalid"),
+                    getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+            return true;
+        }
+        if (margin == -2) {
+            int max = (Math.min(sideX, sideZ) - 1) / 2;
+            JOptionPane.showMessageDialog(this, getString("error.flowerCenterTooLarge", max),
+                    getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+            return true;
+        }
+        return false;
+    }
+
+    /** Re-localizes the horizontal/vertical dropdown without losing the selection. */
+    private void refreshOrientationCombo(JComboBox<String> combo) {
+        if (combo == null) {
+            return;
+        }
+        int selected = Math.max(0, Math.min(1, combo.getSelectedIndex()));
+        combo.setModel(new DefaultComboBoxModel<>(new String[]{
+                getString("label.orientationHorizontal"), getString("label.orientationVertical")}));
+        combo.setSelectedIndex(selected);
     }
 
     private String selectedMcVersion(JComboBox<String> combo) {
@@ -300,6 +447,7 @@ public class FlowerFarmFinderFrame extends JFrame {
             }
             JTextField viewField = searchTab ? searchViewDistanceField : listViewDistanceField;
             if (viewField != null) viewField.setEnabled(editable);
+            applyFilterEnable(searchTab);
         } finally {
             mcVersionSideUpdating = false;
         }
@@ -721,9 +869,73 @@ public class FlowerFarmFinderFrame extends JFrame {
         inputPanel.add(searchFastModeCheckBox, gbc);
         gbc.gridwidth = 1;
 
-        // Seed 输入
+        // 筛选条件：两种野花、玄武岩三角洲、横向/竖向
         gbc.gridx = 0;
         gbc.gridy = 12;
+        gbc.gridwidth = 2;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        searchBothWildflowersCheckBox = new JCheckBox(getString("label.requireBothWildflowers"), false);
+        searchBothWildflowersCheckBox.setFont(getLoadedFont());
+        inputPanel.add(searchBothWildflowersCheckBox, gbc);
+        gbc.gridwidth = 1;
+
+        gbc.gridx = 0;
+        gbc.gridy = 13;
+        gbc.gridwidth = 2;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        searchBasaltCheckBox = new JCheckBox(getString("label.requireBasaltDeltas"), false);
+        searchBasaltCheckBox.setFont(getLoadedFont());
+        inputPanel.add(searchBasaltCheckBox, gbc);
+        gbc.gridwidth = 1;
+
+        gbc.gridx = 0;
+        gbc.gridy = 14;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.weightx = 0;
+        searchOrientationCheckBox = new JCheckBox(getString("label.requireOrientation"), false);
+        searchOrientationCheckBox.setFont(getLoadedFont());
+        searchOrientationCheckBox.addActionListener(e -> applyOrientationEnable(true));
+        inputPanel.add(searchOrientationCheckBox, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        searchOrientationComboBox = new JComboBox<>(new String[]{
+                getString("label.orientationHorizontal"), getString("label.orientationVertical")});
+        searchOrientationComboBox.setFont(getLoadedFont());
+        searchOrientationComboBox.setSelectedIndex(0);
+        inputPanel.add(searchOrientationComboBox, gbc);
+        applyOrientationEnable(true);
+
+        // 筛选条件：繁花森林离边距离（两处花梯度极端都须落在窗口中心区内）
+        gbc.gridx = 0;
+        gbc.gridy = 15;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.weightx = 0;
+        searchFlowerCenterCheckBox = new JCheckBox(getString("label.flowerCenterMargin"), false);
+        searchFlowerCenterCheckBox.setFont(getLoadedFont());
+        searchFlowerCenterCheckBox.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        searchFlowerCenterCheckBox.addActionListener(e -> applyFlowerCenterEnable(true));
+        inputPanel.add(searchFlowerCenterCheckBox, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        searchFlowerCenterField = new JTextField(String.valueOf(FLOWER_CENTER_MARGIN_DEFAULT), 6);
+        searchFlowerCenterField.setFont(getLoadedFont());
+        searchFlowerCenterField.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        searchFlowerCenterField.addFocusListener(new java.awt.event.FocusAdapter() {
+            public void focusLost(java.awt.event.FocusEvent e) {
+                validateIntegerInput(searchFlowerCenterField,
+                        getString("label.flowerCenterMargin").replace(":", ""));
+            }
+        });
+        inputPanel.add(searchFlowerCenterField, gbc);
+        applyFlowerCenterEnable(true);
+
+        // Seed 输入
+        gbc.gridx = 0;
+        gbc.gridy = 16;
         gbc.fill = GridBagConstraints.NONE;
         gbc.weightx = 0;
         searchLanguageLabel = new JLabel(getString("label.language"));
@@ -760,7 +972,7 @@ public class FlowerFarmFinderFrame extends JFrame {
 
         // Static credit text above buttons
         JPanel creditPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
-        creditPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        creditPanel.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
         searchCreditLabel = new JLabel(buildCreditText());
         searchCreditLabel.setFont(getLoadedFont());
         creditPanel.add(searchCreditLabel);
@@ -1133,6 +1345,9 @@ public class FlowerFarmFinderFrame extends JFrame {
             }
 
             boolean fastMode = isSearchFastMode();
+            boolean bothWildflowers = isBothWildflowersFilter(searchBothWildflowersCheckBox);
+            boolean basaltDeltas = isBasaltFilter(searchBasaltCheckBox);
+            int orientation = selectedOrientation(searchOrientationCheckBox, searchOrientationComboBox);
             String mcVersion = selectedMcVersion(searchMcVersionComboBox);
             int longSide = readLongSide(searchLongSideField);
             if (longSide < 0) {
@@ -1143,6 +1358,13 @@ public class FlowerFarmFinderFrame extends JFrame {
             int shortSide = readShortSide(searchLongSideField, searchShortSideField, searchShortSideCheckBox);
             if (shortSide < 0) {
                 JOptionPane.showMessageDialog(this, getString("error.shortSideInvalid"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            int demandSideX = longSide;
+            int demandSideZ = squareOnly ? longSide : shortSide;
+            int flowerCenterMargin = readFlowerCenterMargin(searchFlowerCenterCheckBox, searchFlowerCenterField,
+                    demandSideX, demandSideZ);
+            if (reportFlowerCenterMarginError(flowerCenterMargin, demandSideX, demandSideZ)) {
                 return;
             }
 
@@ -1265,6 +1487,12 @@ public class FlowerFarmFinderFrame extends JFrame {
             searchShortSideField.setEnabled(false);
             searchViewDistanceField.setEnabled(false);
             if (searchFastModeCheckBox != null) searchFastModeCheckBox.setEnabled(false);
+            if (searchBothWildflowersCheckBox != null) searchBothWildflowersCheckBox.setEnabled(false);
+            if (searchBasaltCheckBox != null) searchBasaltCheckBox.setEnabled(false);
+            if (searchOrientationCheckBox != null) searchOrientationCheckBox.setEnabled(false);
+            if (searchOrientationComboBox != null) searchOrientationComboBox.setEnabled(false);
+            if (searchFlowerCenterCheckBox != null) searchFlowerCenterCheckBox.setEnabled(false);
+            if (searchFlowerCenterField != null) searchFlowerCenterField.setEnabled(false);
             if (searchMcVersionComboBox != null) searchMcVersionComboBox.setEnabled(false);
             applyBoundFieldEnableState(false);
             if (languageComboBox != null) languageComboBox.setEnabled(false);
@@ -1279,7 +1507,7 @@ public class FlowerFarmFinderFrame extends JFrame {
             searchRunner = new FlowerFarmFinderSearchRunner();
             if (searchShortSideCheckBox != null) searchShortSideCheckBox.setEnabled(false);
             if (!searchRunner.startFlowerSearch(seed, minX, maxX, minZ, maxZ, longSide, shortSide, squareOnly,
-                threadCount, fastMode, mcVersion,
+                threadCount, fastMode, bothWildflowers, basaltDeltas, orientation, flowerCenterMargin, mcVersion,
                 info -> updateCaveSearchProgress(resultToken, info),
                 line -> addSearchResult(resultToken, line))) {
                 isSearchRunning = false;
@@ -1722,6 +1950,70 @@ public class FlowerFarmFinderFrame extends JFrame {
         inputPanel.add(listFastModeCheckBox, gbc);
         gbc.gridwidth = 1;
 
+        // 筛选条件：两种野花、玄武岩三角洲、横向/竖向
+        gbc.gridx = 0;
+        gbc.gridy = 12;
+        gbc.gridwidth = 2;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        listBothWildflowersCheckBox = new JCheckBox(getString("label.requireBothWildflowers"), false);
+        listBothWildflowersCheckBox.setFont(getLoadedFont());
+        inputPanel.add(listBothWildflowersCheckBox, gbc);
+        gbc.gridwidth = 1;
+
+        gbc.gridx = 0;
+        gbc.gridy = 13;
+        gbc.gridwidth = 2;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        listBasaltCheckBox = new JCheckBox(getString("label.requireBasaltDeltas"), false);
+        listBasaltCheckBox.setFont(getLoadedFont());
+        inputPanel.add(listBasaltCheckBox, gbc);
+        gbc.gridwidth = 1;
+
+        gbc.gridx = 0;
+        gbc.gridy = 14;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.weightx = 0;
+        listOrientationCheckBox = new JCheckBox(getString("label.requireOrientation"), false);
+        listOrientationCheckBox.setFont(getLoadedFont());
+        listOrientationCheckBox.addActionListener(e -> applyOrientationEnable(false));
+        inputPanel.add(listOrientationCheckBox, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        listOrientationComboBox = new JComboBox<>(new String[]{
+                getString("label.orientationHorizontal"), getString("label.orientationVertical")});
+        listOrientationComboBox.setFont(getLoadedFont());
+        listOrientationComboBox.setSelectedIndex(0);
+        inputPanel.add(listOrientationComboBox, gbc);
+        applyOrientationEnable(false);
+
+        // 筛选条件：繁花森林离边距离（两处花梯度极端都须落在窗口中心区内）
+        gbc.gridx = 0;
+        gbc.gridy = 15;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.weightx = 0;
+        listFlowerCenterCheckBox = new JCheckBox(getString("label.flowerCenterMargin"), false);
+        listFlowerCenterCheckBox.setFont(getLoadedFont());
+        listFlowerCenterCheckBox.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        listFlowerCenterCheckBox.addActionListener(e -> applyFlowerCenterEnable(false));
+        inputPanel.add(listFlowerCenterCheckBox, gbc);
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        listFlowerCenterField = new JTextField(String.valueOf(FLOWER_CENTER_MARGIN_DEFAULT), 6);
+        listFlowerCenterField.setFont(getLoadedFont());
+        listFlowerCenterField.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        listFlowerCenterField.addFocusListener(new java.awt.event.FocusAdapter() {
+            public void focusLost(java.awt.event.FocusEvent e) {
+                validateIntegerInput(listFlowerCenterField,
+                        getString("label.flowerCenterMargin").replace(":", ""));
+            }
+        });
+        inputPanel.add(listFlowerCenterField, gbc);
+        applyFlowerCenterEnable(false);
+
         // 按钮区域
         JPanel buttonPanel = new JPanel(new FlowLayout());
         listSearchStartButton = new JButton(getString("button.startSearch"));
@@ -1737,7 +2029,7 @@ public class FlowerFarmFinderFrame extends JFrame {
 
         // Static credit text above buttons
         JPanel creditPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
-        creditPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        creditPanel.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
         listSearchCreditLabel = new JLabel(buildCreditText());
         listSearchCreditLabel.setFont(getLoadedFont());
         creditPanel.add(listSearchCreditLabel);
@@ -1850,12 +2142,21 @@ public class FlowerFarmFinderFrame extends JFrame {
             }
             if (!isSearchRunning) return;
 
-            searchProgressBar.setIndeterminate(false);
-            int progress = (int) Math.min(100, info.percentage());
-            searchProgressBar.setValue(progress);
-            String stageKey = (info.phase() == 0) ? "progress.stage0"
-                    : ((info.phase() == 2 || info.phase() == -1) ? "progress.stage2" : "progress.stage1");
-            searchProgressBar.setString(getString(stageKey, info.processed(), info.total(), info.percentage()));
+            int phase = info.phase();
+            // Phase 2 only merges/clusters the candidate windows and its native
+            // counters still belong to the climate screen, so there is no valid
+            // percentage: show "running" with a moving bar instead.
+            boolean mergePhase = (phase == PHASE_MERGE || phase == -1);
+            searchProgressBar.setIndeterminate(mergePhase);
+            if (!mergePhase) {
+                searchProgressBar.setValue((int) Math.min(100, info.percentage()));
+            }
+            String stageKey = (phase == PHASE_PREPARING) ? "progress.stage0"
+                    : mergePhase ? "progress.stage2"
+                    : (phase == PHASE_VERIFY) ? "progress.stage3" : "progress.stage1";
+            searchProgressBar.setString(mergePhase
+                    ? getString(stageKey)
+                    : getString(stageKey, info.processed(), info.total(), info.percentage()));
 
             searchElapsedTimeLabel.setText(getString("elapsedTime", formatTime(info.elapsedMs())));
             if (isSearchPaused) {
@@ -1864,7 +2165,7 @@ public class FlowerFarmFinderFrame extends JFrame {
                         : getString("remainingTime.calculating"));
                 return;
             }
-            if (info.phase() == -1) {
+            if (mergePhase) {
                 searchRemainingTimeLabel.setText(getString("remainingTime.calculating"));
                 return;
             }
@@ -1887,6 +2188,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         searchThreadCountField.setEnabled(true);
         if (searchFastModeCheckBox != null) searchFastModeCheckBox.setEnabled(true);
         if (searchMcVersionComboBox != null) searchMcVersionComboBox.setEnabled(true);
+        applyFilterEnable(true);
         enableSideFields(true);
         applyBoundFieldEnableState(true);
         if (languageComboBox != null) languageComboBox.setEnabled(true);
@@ -2118,6 +2420,23 @@ public class FlowerFarmFinderFrame extends JFrame {
         if (searchFastModeCheckBox != null) {
             searchFastModeCheckBox.setText(getString("label.fastMode"));
         }
+        if (searchBothWildflowersCheckBox != null) {
+            searchBothWildflowersCheckBox.setText(getString("label.requireBothWildflowers"));
+        }
+        if (searchBasaltCheckBox != null) {
+            searchBasaltCheckBox.setText(getString("label.requireBasaltDeltas"));
+        }
+        if (searchOrientationCheckBox != null) {
+            searchOrientationCheckBox.setText(getString("label.requireOrientation"));
+        }
+        refreshOrientationCombo(searchOrientationComboBox);
+        if (searchFlowerCenterCheckBox != null) {
+            searchFlowerCenterCheckBox.setText(getString("label.flowerCenterMargin"));
+            searchFlowerCenterCheckBox.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        }
+        if (searchFlowerCenterField != null) {
+            searchFlowerCenterField.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        }
         if (searchMcVersionLabel != null) {
             searchMcVersionLabel.setText(getString("label.mcVersion"));
         }
@@ -2223,6 +2542,23 @@ public class FlowerFarmFinderFrame extends JFrame {
         }
         if (listFastModeCheckBox != null) {
             listFastModeCheckBox.setText(getString("label.fastMode"));
+        }
+        if (listBothWildflowersCheckBox != null) {
+            listBothWildflowersCheckBox.setText(getString("label.requireBothWildflowers"));
+        }
+        if (listBasaltCheckBox != null) {
+            listBasaltCheckBox.setText(getString("label.requireBasaltDeltas"));
+        }
+        if (listOrientationCheckBox != null) {
+            listOrientationCheckBox.setText(getString("label.requireOrientation"));
+        }
+        refreshOrientationCombo(listOrientationComboBox);
+        if (listFlowerCenterCheckBox != null) {
+            listFlowerCenterCheckBox.setText(getString("label.flowerCenterMargin"));
+            listFlowerCenterCheckBox.setToolTipText(getString("tooltip.flowerCenterMargin"));
+        }
+        if (listFlowerCenterField != null) {
+            listFlowerCenterField.setToolTipText(getString("tooltip.flowerCenterMargin"));
         }
         if (listMcVersionLabel != null) {
             listMcVersionLabel.setText(getString("label.mcVersion"));
@@ -2533,6 +2869,9 @@ public class FlowerFarmFinderFrame extends JFrame {
             }
 
             boolean fastMode = isListFastMode();
+            boolean bothWildflowers = isBothWildflowersFilter(listBothWildflowersCheckBox);
+            boolean basaltDeltas = isBasaltFilter(listBasaltCheckBox);
+            int orientation = selectedOrientation(listOrientationCheckBox, listOrientationComboBox);
             String mcVersion = selectedMcVersion(listMcVersionComboBox);
             int longSide = readLongSide(listLongSideField);
             if (longSide < 0) {
@@ -2543,6 +2882,13 @@ public class FlowerFarmFinderFrame extends JFrame {
             int shortSide = readShortSide(listLongSideField, listShortSideField, listShortSideCheckBox);
             if (shortSide < 0) {
                 JOptionPane.showMessageDialog(this, getString("error.shortSideInvalid"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            int demandSideX = longSide;
+            int demandSideZ = squareOnly ? longSide : shortSide;
+            int flowerCenterMargin = readFlowerCenterMargin(listFlowerCenterCheckBox, listFlowerCenterField,
+                    demandSideX, demandSideZ);
+            if (reportFlowerCenterMarginError(flowerCenterMargin, demandSideX, demandSideZ)) {
                 return;
             }
 
@@ -2648,6 +2994,12 @@ public class FlowerFarmFinderFrame extends JFrame {
             if (listShortSideCheckBox != null) listShortSideCheckBox.setEnabled(false);
             listViewDistanceField.setEnabled(false);
             if (listFastModeCheckBox != null) listFastModeCheckBox.setEnabled(false);
+            if (listBothWildflowersCheckBox != null) listBothWildflowersCheckBox.setEnabled(false);
+            if (listBasaltCheckBox != null) listBasaltCheckBox.setEnabled(false);
+            if (listOrientationCheckBox != null) listOrientationCheckBox.setEnabled(false);
+            if (listOrientationComboBox != null) listOrientationComboBox.setEnabled(false);
+            if (listFlowerCenterCheckBox != null) listFlowerCenterCheckBox.setEnabled(false);
+            if (listFlowerCenterField != null) listFlowerCenterField.setEnabled(false);
             if (listMcVersionComboBox != null) listMcVersionComboBox.setEnabled(false);
             applyListBoundFieldEnableState(false);
             final long listResultToken = listSearchResultToken.incrementAndGet();
@@ -2666,6 +3018,10 @@ public class FlowerFarmFinderFrame extends JFrame {
             final boolean finalSquareOnly = squareOnly;
             final int finalThreadCount = threadCount;
             final boolean finalFastMode = fastMode;
+            final boolean finalBothWildflowers = bothWildflowers;
+            final boolean finalBasaltDeltas = basaltDeltas;
+            final int finalOrientation = orientation;
+            final int finalFlowerCenterMargin = flowerCenterMargin;
             final String finalMcVersion = mcVersion;
             final long totalSeeds = seeds.size();
             final long startTime = System.currentTimeMillis();
@@ -2774,15 +3130,19 @@ public class FlowerFarmFinderFrame extends JFrame {
                                 return;
                             }
                             if (isListSearchRunning) {
-                                String key = (phase == 2 || phase == -1) ? "currentSeed.stage2" : "currentSeed.stage1";
-                                listSearchCurrentSeedProgressLabel.setText(
-                                        getString(key, currentSeedIndex, totalSeeds, proc, tot, pct));
+                                // Phase 2 (merge/cluster) has no valid counters: report "running".
+                                boolean mergePhase = (phase == PHASE_MERGE || phase == -1);
+                                String key = mergePhase ? "currentSeed.stage2"
+                                        : (phase == PHASE_VERIFY) ? "currentSeed.stage3" : "currentSeed.stage1";
+                                listSearchCurrentSeedProgressLabel.setText(mergePhase
+                                        ? getString(key, currentSeedIndex, totalSeeds)
+                                        : getString(key, currentSeedIndex, totalSeeds, proc, tot, pct));
                             }
                         });
                     };
 
                     if (listShortSideCheckBox != null) listShortSideCheckBox.setEnabled(false);
-                    listSearchRunner.runFlowerSearchBlocking(seed, minX, maxX, minZ, maxZ, finalLongSide, finalShortSide, finalSquareOnly, finalThreadCount, finalFastMode, finalMcVersion, seedProgressCallback, seedResultCallback);
+                    listSearchRunner.runFlowerSearchBlocking(seed, minX, maxX, minZ, maxZ, finalLongSide, finalShortSide, finalSquareOnly, finalThreadCount, finalFastMode, finalBothWildflowers, finalBasaltDeltas, finalOrientation, finalFlowerCenterMargin, finalMcVersion, seedProgressCallback, seedResultCallback);
 
                     while (listSearchRunner.isRunning() && isListSearchRunning) {
                         while (isListSearchPaused && isListSearchRunning) {
@@ -2861,6 +3221,7 @@ public class FlowerFarmFinderFrame extends JFrame {
                     listSearchThreadCountField.setEnabled(true);
                     if (listFastModeCheckBox != null) listFastModeCheckBox.setEnabled(true);
                     if (listMcVersionComboBox != null) listMcVersionComboBox.setEnabled(true);
+                    applyFilterEnable(false);
                     enableSideFields(false);
                     applyListBoundFieldEnableState(true);
                     listSearchProgressBar.setValue((int) totalSeeds);
@@ -2906,6 +3267,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         listSearchThreadCountField.setEnabled(true);
         if (listFastModeCheckBox != null) listFastModeCheckBox.setEnabled(true);
         if (listMcVersionComboBox != null) listMcVersionComboBox.setEnabled(true);
+        applyFilterEnable(false);
         enableSideFields(false);
         applyListBoundFieldEnableState(true);
         listSearchRemainingTimeLabel.setText(getString("remainingTime.stopped"));

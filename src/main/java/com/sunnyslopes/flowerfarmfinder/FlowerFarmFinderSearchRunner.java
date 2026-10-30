@@ -47,6 +47,24 @@ public class FlowerFarmFinderSearchRunner {
     public static final int FLOWER_FRAME_STEP_FAST = 16;
     public static final int FLOWER_FRAME_STEP_PRECISE = 4;
 
+    /** Optional result filters passed to native CTS. */
+    public static final int FILTER_ORIENTATION_ANY = 0;
+    public static final int FILTER_ORIENTATION_HORIZONTAL = 1;
+    public static final int FILTER_ORIENTATION_VERTICAL = 2;
+
+    /* ---- Native search phases, in the order the search runs them ---- */
+    /** Preparing climate / generators. */
+    public static final int PHASE_PREPARING = 0;
+    /** Climate screen (CTS coarse filter over the search area). */
+    public static final int PHASE_CLIMATE = 1;
+    /** Post-screen merge/cluster of candidate windows; no meaningful numeric progress. */
+    public static final int PHASE_MERGE = 2;
+    /** Biome verification of the candidate windows. */
+    public static final int PHASE_VERIFY = 3;
+
+    /** Default flower-forest edge margin (blocks); the filter stays off until checked. */
+    public static final int FLOWER_CENTER_MARGIN_DEFAULT = 0;
+
     private static final long PROGRESS_POLL_MS = 100L;
 
     /** Map UI range label to cubiomes version string passed to native. */
@@ -62,8 +80,17 @@ public class FlowerFarmFinderSearchRunner {
         return uiSelection == null || uiSelection.isBlank() || MC_RANGE_1_21_4.equals(uiSelection.trim());
     }
 
+    /** Normalizes the orientation filter to {@link #FILTER_ORIENTATION_ANY}/HORIZONTAL/VERTICAL. */
+    public static int clampOrientation(int orientation) {
+        return (orientation == FILTER_ORIENTATION_HORIZONTAL || orientation == FILTER_ORIENTATION_VERTICAL)
+                ? orientation : FILTER_ORIENTATION_ANY;
+    }
+
     /**
+     * @param phase {@link #PHASE_PREPARING} / {@link #PHASE_CLIMATE} / {@link #PHASE_MERGE} / {@link #PHASE_VERIFY};
+     *     phase 2 (merge/cluster) has no meaningful numeric progress, only "running".
      * @param done when true, search has finished (success, stop, or error); UI should re-enable controls.
+     * @param refiningResults native phase 3 (biome verification) is running.
      * @param nativePauseSettled when {@code true}, native pause has taken effect (progress stopped moving for a grace period).
      * @param nativeStopRequested native stop flag is set (search may still be winding down until {@code done}).
      */
@@ -74,16 +101,16 @@ public class FlowerFarmFinderSearchRunner {
             return of(phase, processed, total, elapsedMs, remainingMs, false, false, false);
         }
 
-        /** @param refiningResults native phase 2 (post-scan refinement). */
+        /** @param verifyingResults native phase 3 (biome verification). */
         public static ProgressInfo of(int phase, long processed, long total, long elapsedMs, long remainingMs,
-                                      boolean refiningResults) {
-            return of(phase, processed, total, elapsedMs, remainingMs, refiningResults, false, false);
+                                      boolean verifyingResults) {
+            return of(phase, processed, total, elapsedMs, remainingMs, verifyingResults, false, false);
         }
 
         public static ProgressInfo of(int phase, long processed, long total, long elapsedMs, long remainingMs,
-                                      boolean refiningResults, boolean nativePauseSettled, boolean nativeStopRequested) {
+                                      boolean verifyingResults, boolean nativePauseSettled, boolean nativeStopRequested) {
             double pct = total > 0 ? (processed * 100.0 / total) : 0;
-            return new ProgressInfo(phase, processed, total, pct, elapsedMs, remainingMs, 0, 0, false, refiningResults,
+            return new ProgressInfo(phase, processed, total, pct, elapsedMs, remainingMs, 0, 0, false, verifyingResults,
                 nativePauseSettled, nativeStopRequested);
         }
 
@@ -160,13 +187,15 @@ public class FlowerFarmFinderSearchRunner {
     /** Start flower-farm search. {@code shortSide} equals {@code longSide} when the short side is off. */
     public boolean startFlowerSearch(long seed, int minX, int maxX, int minZ, int maxZ,
                                      int longSide, int shortSide, boolean squareOnly, int threadCount,
-                                     boolean fastMode, String mcVersion,
+                                     boolean fastMode, boolean bothWildflowers, boolean basaltDeltas,
+                                     int orientation, int flowerCenterMargin, String mcVersion,
                                      Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback) {
         if (!tryAcquireActiveRunner()) {
             return false;
         }
         Thread t = new Thread(() -> runFlowerSearch(seed, minX, maxX, minZ, maxZ, longSide, shortSide, squareOnly,
-                threadCount, fastMode, mcVersion, progressCallback, resultCallback),
+                threadCount, fastMode, bothWildflowers, basaltDeltas, orientation, flowerCenterMargin, mcVersion,
+                progressCallback, resultCallback),
             "flower-farm-search");
         t.setDaemon(true);
         t.start();
@@ -175,13 +204,14 @@ public class FlowerFarmFinderSearchRunner {
 
     public boolean runFlowerSearchBlocking(long seed, int minX, int maxX, int minZ, int maxZ,
                                            int longSide, int shortSide, boolean squareOnly, int threadCount,
-                                           boolean fastMode, String mcVersion,
+                                           boolean fastMode, boolean bothWildflowers, boolean basaltDeltas,
+                                           int orientation, int flowerCenterMargin, String mcVersion,
                                            Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback) {
         if (!tryAcquireActiveRunner()) {
             return false;
         }
         runFlowerSearch(seed, minX, maxX, minZ, maxZ, longSide, shortSide, squareOnly, threadCount, fastMode,
-            mcVersion, progressCallback, resultCallback);
+            bothWildflowers, basaltDeltas, orientation, flowerCenterMargin, mcVersion, progressCallback, resultCallback);
         return true;
     }
 
@@ -205,7 +235,8 @@ public class FlowerFarmFinderSearchRunner {
 
     private void runFlowerSearch(long seed, int minX, int maxX, int minZ, int maxZ,
                                  int longSide, int shortSide, boolean squareOnly, int threadCount,
-                                 boolean fastMode, String mcVersion,
+                                 boolean fastMode, boolean bothWildflowers, boolean basaltDeltas,
+                                 int orientation, int flowerCenterMargin, String mcVersion,
                                  Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback) {
         isRunning = true;
         isPaused = false;
@@ -234,7 +265,7 @@ public class FlowerFarmFinderSearchRunner {
 
         AtomicLong lastProcessed = new AtomicLong(0);
         AtomicLong lastTotal = new AtomicLong(0);
-        AtomicLong phase2StartElapsedMs = new AtomicLong(-1L);
+        AtomicLong verifyStartElapsedMs = new AtomicLong(-1L);
         AtomicLong lastProgressWallMs = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCurSeen = new AtomicLong(Long.MIN_VALUE);
         AtomicInteger lastPhaseSeen = new AtomicInteger(Integer.MIN_VALUE);
@@ -271,22 +302,24 @@ public class FlowerFarmFinderSearchRunner {
                 // search as paused once progress has not moved for a short grace
                 // period, instead of claiming it immediately.
                 boolean pauseSettled = tryPause && (now - lastProgressWallMs.get() >= 300L);
-                if (nPhase == 2) {
-                    phase2StartElapsedMs.compareAndSet(-1L, elapsed);
+                if (nPhase == PHASE_VERIFY) {
+                    verifyStartElapsedMs.compareAndSet(-1L, elapsed);
                 }
-                long phaseStart = nPhase == 2 ? phase2StartElapsedMs.get() : 0L;
+                long phaseStart = nPhase == PHASE_VERIFY ? verifyStartElapsedMs.get() : 0L;
                 long phaseElapsed = Math.max(0L, elapsed - Math.max(0L, phaseStart));
                 lastProcessed.set(cur);
                 lastTotal.set(tot);
                 long remaining = 0L;
-                if (!isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
+                // Phase 2 (merge/cluster) reports the climate-screen counters, which
+                // no longer describe its own work, so it gets no estimate.
+                if (nPhase != PHASE_MERGE && !isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
                     double eta = phaseElapsed * ((double) (tot - cur) / (double) cur);
                     if (eta > 0 && eta < (double) Long.MAX_VALUE) {
                         remaining = (long) eta;
                     }
                 }
                 progressCallback.accept(ProgressInfo.of(nPhase, cur, tot, elapsed, remaining,
-                    nPhase == 2, pauseSettled, tryStop));
+                    nPhase == PHASE_VERIFY, pauseSettled, tryStop));
             } catch (Throwable ignored) {
             }
         }, PROGRESS_POLL_MS, PROGRESS_POLL_MS, TimeUnit.MILLISECONDS);
@@ -299,7 +332,9 @@ public class FlowerFarmFinderSearchRunner {
             String[] raw;
             synchronized (NATIVE_LOCK) {
                 raw = FlowerFarmFinderBridge.flowerSearch(seed, minX, minZ, maxX, maxZ,
-                    longSide, sideB, squareOnly ? 1 : 0, step, threads, mc);
+                    longSide, sideB, squareOnly ? 1 : 0, step, threads,
+                    bothWildflowers ? 1 : 0, basaltDeltas ? 1 : 0,
+                    clampOrientation(orientation), Math.max(0, flowerCenterMargin), mc);
             }
             if (raw != null && resultCallback != null && raw.length > 0) {
                 StringBuilder sb = new StringBuilder();

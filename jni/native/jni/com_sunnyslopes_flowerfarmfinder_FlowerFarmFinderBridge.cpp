@@ -14,9 +14,10 @@
 struct Progress {
     std::atomic_int current{0};
     std::atomic_int total{0};
-    std::atomic_int phase{0};          // 0 = preparation, 1 = screen, 2 = verify
+    std::atomic_int phase{0};          // 0 = preparation, 1 = screen, 2 = merge/cluster tail, 3 = verify
     std::atomic_int overallCurrent{0};
     std::atomic_int overallTotal{0};
+    std::atomic_int stage{0};          // 1 while the post-screen merge/cluster tail runs
     std::atomic_bool try_pause{false};
     std::atomic_bool try_stop{false};
 };
@@ -31,13 +32,16 @@ static void resetProgressState()
     progress.phase.store(0);
     progress.overallCurrent.store(0);
     progress.overallTotal.store(0);
+    progress.stage.store(0);
     progress.try_pause.store(false);
     progress.try_stop.store(false);
 }
 
 JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge_flowerSearch
   (JNIEnv *env, jclass, jlong seed, jint minX, jint minZ, jint maxX, jint maxZ,
-   jint longSide, jint shortSide, jint squareOnly, jint frameStep, jint numThreads, jstring mcVersion)
+   jint longSide, jint shortSide, jint squareOnly, jint frameStep, jint numThreads,
+   jint bothWildflowers, jint basaltDeltas, jint orientation, jint flowerCenterMargin,
+   jstring mcVersion)
 {
     std::lock_guard<std::mutex> guard(searchMutex);
     int mc = MC_NEWEST;
@@ -57,7 +61,8 @@ JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmF
         &progress.current, &progress.total, &progress.phase,
         &progress.try_pause, &progress.try_stop,
         &progress.current, &progress.total,
-        &progress.overallCurrent, &progress.overallTotal
+        &progress.overallCurrent, &progress.overallTotal,
+        &progress.stage
     };
     unsigned hw = std::thread::hardware_concurrency();
     int maxThreads = hw > 0 ? (int) hw : 1;
@@ -67,9 +72,14 @@ JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmF
     if (threads > maxThreads)
         threads = maxThreads;
     std::vector<std::string> lines;
+    FlowerSearchOptions options{};
+    options.requireBothWildflowers = bothWildflowers != 0;
+    options.requireBasaltDeltas = basaltDeltas != 0;
+    options.orientation = orientation;
+    options.flowerCenterMargin = flowerCenterMargin > 0 ? (int) flowerCenterMargin : 0;
     try {
         lines = runFlowerFarmSearch((uint64_t) seed, mc, minX, minZ, maxX, maxZ,
-            longSide, shortSide, squareOnly != 0, frameStep, threads, control);
+            longSide, shortSide, squareOnly != 0, frameStep, threads, control, options);
     } catch (const std::bad_alloc &) {
         resetProgressState();
         return nullptr;
@@ -107,9 +117,13 @@ JNIEXPORT jintArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFind
         return nullptr;
 
     int phase = progress.phase.load();
+    /* The merge/cluster tail after the climate screen is phase 2; verification
+     * is phase 3, so the reported phases follow the search order. */
+    if (phase == 1 && progress.stage.load() != 0)
+        phase = 2;
     int cur = progress.current.load();
     int status = 1;
-    if (phase == 2)
+    if (phase == 3)
         status = cur >= tot ? 2 : 1;
     int overallCur = progress.overallCurrent.load();
     int overallTot = progress.overallTotal.load();

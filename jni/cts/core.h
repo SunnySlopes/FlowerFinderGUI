@@ -171,6 +171,11 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
 /* Optional search progress. current/total are plain ints updated atomically. */
 void cts_bind_progress(int *current, int *total);
 
+/* Optional sub-stage signal. The engine stores 1 while the final merge/cluster
+ * tail (after the scan rows finished) is running and 0 otherwise, so hosts can
+ * label that tail separately. Pass NULL to unbind. */
+void cts_bind_stage(int *stage);
+
 /* Optional cooperative control.  stopped() is a cheap non-blocking check;
  * checkpoint() blocks while paused and returns nonzero when the search must
  * abort (stopped, including a stop issued during a pause).  Both callbacks are

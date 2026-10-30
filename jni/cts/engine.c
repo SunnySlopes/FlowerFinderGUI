@@ -11,7 +11,12 @@
 
 static int *prog_cur;
 static int *prog_tot;
+static int *prog_stage;
 static int prog_preset;
+
+/* Per-thread depth of tile calls.  Tile scans may run their own merge/cluster;
+ * those are still part of the parallel scan and must not flip the global stage. */
+static _Thread_local int tile_depth;
 
 static CtsControlFn ctl_stopped_fn;
 static CtsControlFn ctl_checkpoint_fn;
@@ -22,6 +27,24 @@ void cts_bind_progress(int *current, int *total)
     prog_cur = current;
     prog_tot = total;
     prog_preset = 0;
+}
+
+void cts_bind_stage(int *stage)
+{
+    prog_stage = stage;
+}
+
+static void progress_stage(int value)
+{
+    if (prog_stage)
+        __atomic_store_n(prog_stage, value, __ATOMIC_RELAXED);
+}
+
+/* Marks the post-scan merge/cluster tail only on the parent thread. */
+static void progress_stage_tail(int value)
+{
+    if (tile_depth == 0)
+        progress_stage(value);
 }
 
 void cts_bind_control(CtsControlFn stopped, CtsControlFn checkpoint, void *user)
@@ -57,8 +80,16 @@ static void progress_expect(int n)
 
 static void progress_tick(void)
 {
-    if (prog_cur)
-        __atomic_fetch_add(prog_cur, 1, __ATOMIC_RELAXED);
+    if (prog_cur) {
+        int cur = __atomic_add_fetch(prog_cur, 1, __ATOMIC_RELAXED);
+        /* Once the last scan unit is ticked, every tile has finished scanning and
+         * only merge/cluster work remains: report that tail as a stage. */
+        if (prog_tot) {
+            int tot = __atomic_load_n(prog_tot, __ATOMIC_RELAXED);
+            if (tot > 1 && cur >= tot - 1)
+                progress_stage(1);
+        }
+    }
 }
 
 /* Never leave the UI at 99% after the real work finished. */
@@ -613,6 +644,7 @@ done:
     free(el); free(hh);
     free(ef); free(hf);
     free(l0minE); free(l0maxE); free(l0minH); free(l0maxH);
+    progress_stage_tail(1);
     if (!stopped && cfg->cluster > 0 &&
         !cluster_hits(hits, nhits, cfg))
         stopped = 1;
@@ -624,6 +656,7 @@ done:
         progress_tick();      /* merge/cluster unit */
         progress_finish();
     }
+    progress_stage_tail(0);
     st->t_total = now_sec() - t0;
     st->hits = *nhits;
     return stopped ? 0 : 1;
@@ -676,6 +709,7 @@ static int screen_area_rect(const Climate *c, int64_t bx0, int64_t bz0,
         }
     }
 done:
+    progress_stage_tail(1);
     if (!stopped && cfg->cluster > 0 &&
         !cluster_hits(hits, nhits, cfg))
         stopped = 1;
@@ -687,6 +721,7 @@ done:
         progress_tick();
         progress_finish();
     }
+    progress_stage_tail(0);
     st->hits = *nhits;
     st->t_total = now_sec() - t0;
     return stopped ? 0 : 1;
@@ -808,6 +843,7 @@ int screen_area_rect_both(const Climate *c, int64_t bx0, int64_t bz0,
     }
 done:
     free(ef); free(hf);
+    progress_stage_tail(1);
     if (!stopped && cfg->cluster > 0) {
         if (!cluster_hits(hits_x, nhits_x, cfg) ||
             !cluster_hits(hits_z, nhits_z, cfg))
@@ -820,6 +856,7 @@ done:
         progress_tick();      /* merge/cluster unit */
         progress_finish();
     }
+    progress_stage_tail(0);
     st->hits = *nhits_x + *nhits_z;
     st->t_total = now_sec() - t0;
     return stopped ? 0 : 1;
@@ -1017,13 +1054,16 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         zb += overlap; if (zb > bz1) zb = bz1;
         xa = align_tile_start(xa, bx0, step_l0);
         za = align_tile_start(za, bz0, step_l0);
+        ++tile_depth;
         screen_area_rect_both(c, xa, za, xb, zb, cfg, step_l0, m_e, m_h,
                               &tr[t].hx, &tr[t].nx,
                               &tr[t].hz, &tr[t].nz, &tr[t].st);
+        --tile_depth;
     }
     prog_preset = 0;
     if (cts_stopped())
         goto stopped;
+    progress_stage_tail(1);
     for (t = 0; t < ntx * ntz; t++) {
         if (cfg->cluster > 0) {
             if (!cluster_hits(&tr[t].hx, &tr[t].nx, cfg) ||
@@ -1082,6 +1122,7 @@ int screen_area_rect_both_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         goto stopped_final;
     progress_tick();          /* merge/cluster unit */
     progress_finish();
+    progress_stage_tail(0);
     st->hits = *nhits_x + *nhits_z;
     st->t_total = now_sec() - t0;
     return 1;
@@ -1092,12 +1133,14 @@ stopped:
     free(ax); free(az);
     *hits_x = NULL; *nhits_x = 0;
     *hits_z = NULL; *nhits_z = 0;
+    progress_stage_tail(0);
     return 0;
 
 stopped_final:
     free(ax); free(az);
     *hits_x = NULL; *nhits_x = 0;
     *hits_z = NULL; *nhits_z = 0;
+    progress_stage_tail(0);
     return 0;
 }
 
@@ -1182,12 +1225,15 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         zb += overlap; if (zb > bz1) zb = bz1;
         xa = align_tile_start(xa, bx0, step_l0);
         za = align_tile_start(za, bz0, step_l0);
+        ++tile_depth;
         screen_area(c, xa, za, xb, zb, cfg, step_l0, m_e, m_h, bg,
                     &tr[t].hits, &tr[t].nhits, &tr[t].st);
+        --tile_depth;
     }
     prog_preset = 0;
     if (cts_stopped())
         goto stopped;
+    progress_stage_tail(1);
     for (t = 0; t < ntx * ntz; t++) {
         if (cfg->cluster > 0 &&
             !cluster_hits(&tr[t].hits, &tr[t].nhits, cfg))
@@ -1233,6 +1279,7 @@ int screen_area_parallel(const Climate *c, int64_t bx0, int64_t bz0,
         goto stopped_final;
     progress_tick();          /* merge/cluster unit */
     progress_finish();
+    progress_stage_tail(0);
     st->hits = *nhits;
     return 1;
 
@@ -1241,11 +1288,13 @@ stopped:
     free(tr);
     free(all);
     *hits = NULL; *nhits = 0;
+    progress_stage_tail(0);
     return 0;
 
 stopped_final:
     free(all);
     *hits = NULL; *nhits = 0;
+    progress_stage_tail(0);
     return 0;
 }
 

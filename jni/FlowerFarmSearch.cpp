@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -58,10 +59,12 @@ struct CtsBinding {
     explicit CtsBinding(FlowerSearchControl &c) : control(c)
     {
         cts_bind_control(&stopRequested, &waitForPause, &control);
+        cts_bind_stage(control.stage ? reinterpret_cast<int *>(control.stage) : nullptr);
     }
     ~CtsBinding()
     {
         cts_bind_control(nullptr, nullptr, nullptr);
+        cts_bind_stage(nullptr);
         cts_bind_progress(nullptr, nullptr);
     }
     FlowerSearchControl &control;
@@ -165,7 +168,9 @@ struct VersionRules {
     bool allowCherry = true;
     bool reportPaleArea = true;
     bool pinkPetalsVersionNote = false;
-    /* Chebyshev dedupe window (blocks). Legacy ranges need a wider merge. */
+    /* Phase-1 candidate clustering (blocks, Chebyshev on window offsets).
+     * This is only a pre-dedupe for the candidate lists; verified rows are
+     * de-duplicated by their actual window overlap instead. */
     int clusterBlocks = 80;
 };
 
@@ -251,12 +256,32 @@ int64_t originDist2(const OutRow &r)
     return (int64_t) r.cx * r.cx + (int64_t) r.cz * r.cz;
 }
 
-/** Prefer cherry grove; else closer to origin. Chebyshev cluster in blocks. */
-bool clusterVerifiedRows(std::vector<OutRow> &rows, int clusterBlocks,
-                         FlowerSearchControl &control)
+int floorDivInt(int value, int divisor)
 {
-    if (rows.size() <= 1 || clusterBlocks <= 0)
+    const int q = value / divisor;
+    const int r = value % divisor;
+    return (r != 0 && ((r < 0) != (divisor < 0))) ? q - 1 : q;
+}
+
+uint64_t windowCellKey(int gx, int gz)
+{
+    return ((uint64_t) (uint32_t) gx << 32) | (uint64_t) (uint32_t) gz;
+}
+
+/**
+ * De-duplicates verified rows by window overlap: a row is kept only when its
+ * sideX × sideZ window does not intersect an already-kept window. `rows` must
+ * be sorted best-first, so the preferred window wins (cherry / nearer origin).
+ * A spatial hash keeps this O(n) for the sparse verified-row lists.
+ */
+bool dedupeOverlappingWindows(std::vector<OutRow> &rows, FlowerSearchControl &control)
+{
+    if (rows.size() <= 1)
         return true;
+    /* Window sides are capped at 1024 blocks (MAX_WINDOW), so a window spans at
+     * most two cells per axis. */
+    constexpr int kCell = 1024;
+    std::unordered_map<uint64_t, std::vector<int>> grid;
     std::vector<OutRow> kept;
     kept.reserve(rows.size());
     for (size_t n = 0; n < rows.size(); n++)
@@ -264,32 +289,60 @@ bool clusterVerifiedRows(std::vector<OutRow> &rows, int clusterBlocks,
         if ((n & 63) == 0 && !pauseOk(control))
             return false;
         const OutRow &h = rows[n];
-        int found = -1;
-        for (size_t j = 0; j < kept.size(); j++)
+        const int sideX = std::max(1, h.sideX);
+        const int sideZ = std::max(1, h.sideZ);
+        const int left = h.cx - sideX / 2;
+        const int top = h.cz - sideZ / 2;
+        const int gx0 = floorDivInt(left, kCell);
+        const int gx1 = floorDivInt(left + sideX - 1, kCell);
+        const int gz0 = floorDivInt(top, kCell);
+        const int gz1 = floorDivInt(top + sideZ - 1, kCell);
+        bool overlaps = false;
+        for (int gz = gz0; gz <= gz1 && !overlaps; gz++)
         {
-            if (std::abs(h.qx - kept[j].qx) * 4 <= clusterBlocks &&
-                std::abs(h.qz - kept[j].qz) * 4 <= clusterBlocks)
+            for (int gx = gx0; gx <= gx1 && !overlaps; gx++)
             {
-                found = (int) j;
-                break;
+                const auto it = grid.find(windowCellKey(gx, gz));
+                if (it == grid.end())
+                    continue;
+                for (int index : it->second)
+                {
+                    const OutRow &k = kept[(size_t) index];
+                    /* Half-open rectangles: touching edges do not overlap. */
+                    if (std::abs(h.cx - k.cx) * 2 < h.sideX + k.sideX &&
+                        std::abs(h.cz - k.cz) * 2 < h.sideZ + k.sideZ)
+                    {
+                        overlaps = true;
+                        break;
+                    }
+                }
             }
         }
-        if (found < 0)
-        {
-            kept.push_back(h);
+        if (overlaps)
             continue;
-        }
-        const OutRow &cur = kept[(size_t) found];
-        bool replace = false;
-        if (h.hasPinkPetals != cur.hasPinkPetals)
-            replace = h.hasPinkPetals > cur.hasPinkPetals;
-        else if (originDist2(h) < originDist2(cur))
-            replace = true;
-        if (replace)
-            kept[(size_t) found] = h;
+        const int index = (int) kept.size();
+        for (int gz = gz0; gz <= gz1; gz++)
+            for (int gx = gx0; gx <= gx1; gx++)
+                grid[windowCellKey(gx, gz)].push_back(index);
+        kept.push_back(h);
     }
     rows.swap(kept);
     return true;
+}
+
+/** Best-first order shared by de-duplication and the final result list. */
+bool rowPreferred(const OutRow &a, const OutRow &b)
+{
+    if (a.hasPinkPetals != b.hasPinkPetals)
+        return a.hasPinkPetals > b.hasPinkPetals;
+    const int64_t da = originDist2(a), db = originDist2(b);
+    if (da != db)
+        return da < db;
+    if (a.qx != b.qx)
+        return a.qx < b.qx;
+    if (a.qz != b.qz)
+        return a.qz < b.qz;
+    return a.order < b.order;
 }
 
 std::string formatRow(const FlowerRow &h, const VersionRules &rules)
@@ -321,6 +374,17 @@ void initFlowerNoise(FlowerNoise &fn)
     const double amp[1] = {1.0};
     xDoublePerlinInit(&fn.dpn, &xr, fn.oct, amp, 0, 1, -1);
 }
+
+/** Window centre used by the flower-forest edge-margin filter (block coords, inclusive). */
+struct WindowCentre {
+    int minX = 0, maxX = 0, minZ = 0, maxZ = 0;
+    bool active = false;
+
+    bool contains(int x, int z) const
+    {
+        return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+    }
+};
 
 int flowerId(const FlowerNoise &fn, int x, int y, int z)
 {
@@ -383,11 +447,18 @@ bool flowerExtremes(const FlowerNoise &fn, const std::vector<int> &xs, const std
 bool considerHit(const Climate &climate, const Generator &overworld, const Generator &nether,
                  const FlowerNoise &flowers, int mc, const VersionRules &rules, const Hit &hit,
                  int winxBlocks, int winzBlocks, char orient, int order,
-                 FlowerSearchControl &control, OutRow &row, bool &accepted)
+                 FlowerSearchControl &control, const FlowerSearchOptions &options,
+                 OutRow &row, bool &accepted)
 {
     accepted = false;
     if (!pauseOk(control))
         return false;
+    /* Orientation filter: horizontal keeps windows with sideX >= sideZ, vertical
+     * the opposite. Square windows satisfy both and are always kept. */
+    if (options.orientation == FLOWER_ORIENT_HORIZONTAL && winxBlocks < winzBlocks)
+        return true;
+    if (options.orientation == FLOWER_ORIENT_VERTICAL && winzBlocks < winxBlocks)
+        return true;
     const int winx = winxBlocks / 4;
     const int winz = winzBlocks / 4;
     if (!biome_precheck(&climate, hit.qx, hit.qz, winx, winz, 1, rules.requirePale ? 1 : 0))
@@ -453,16 +524,42 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
     const int flowerArea = (int) flowerX.size() * 16;
     if (flowerArea <= kFlowerAreaMin)
         return true;
+    /* Flower-forest edge margin: when set, only flower-noise columns at least
+     * `flowerCenterMargin` blocks inside every window edge may provide the two
+     * gradient ends, so both ends are required to fall inside the window centre. */
+    WindowCentre centre;
+    if (options.flowerCenterMargin > 0)
+    {
+        const int margin = options.flowerCenterMargin;
+        if (winxBlocks <= 2 * margin || winzBlocks <= 2 * margin)
+            return true; /* empty centre: no window can pass */
+        centre.active = true;
+        centre.minX = wx + margin;
+        centre.maxX = wx + winxBlocks - 1 - margin;
+        centre.minZ = wz + margin;
+        centre.maxZ = wz + winzBlocks - 1 - margin;
+    }
+    std::vector<int> centreX;
+    std::vector<int> centreZ;
+    centreX.reserve(flowerX.size());
+    centreZ.reserve(flowerZ.size());
+    for (size_t i = 0; i < flowerX.size(); i++)
+    {
+        if (centre.active && !centre.contains(flowerX[i], flowerZ[i]))
+            continue;
+        centreX.push_back(flowerX[i]);
+        centreZ.push_back(flowerZ[i]);
+    }
     const int cap = 512;
-    const int stride = std::max(1, (flowerArea / 16 + cap - 1) / cap);
+    const int stride = std::max(1, ((int) centreX.size() + cap - 1) / cap);
     std::vector<int> sampleX;
     std::vector<int> sampleZ;
-    sampleX.reserve((size_t) std::min((int) flowerX.size(), cap));
+    sampleX.reserve((size_t) std::min((int) centreX.size(), cap));
     sampleZ.reserve(sampleX.capacity());
-    for (size_t i = 0; i < flowerX.size(); i += (size_t) stride)
+    for (size_t i = 0; i < centreX.size(); i += (size_t) stride)
     {
-        sampleX.push_back(flowerX[i]);
-        sampleZ.push_back(flowerZ[i]);
+        sampleX.push_back(centreX[i]);
+        sampleZ.push_back(centreZ[i]);
     }
     int flowerY = 0;
     if (!pauseOk(control))
@@ -472,13 +569,21 @@ bool considerHit(const Climate &climate, const Generator &overworld, const Gener
 
     const int cx = wx + winxBlocks / 2;
     const int cz = wz + winzBlocks / 2;
+    const bool woodBonus = rules.allowBirchMeadow && (birchCells || oldCells || meadowCells);
+    const bool cherryBonus = rules.allowCherry && cherryCells > 0;
+    /* "Both wildflowers" filter: the window must contain the wildflower biome
+     * bonus and the cherry (pink petals) bonus at the same time. */
+    if (options.requireBothWildflowers && !(woodBonus && cherryBonus))
+        return true;
     if (!pauseOk(control))
         return false;
     const std::string netherList =
         netherBiomesInWindow(nether, wx, wz, winxBlocks, winzBlocks, mc);
     const bool basalt = netherList.find("basalt_deltas") != std::string::npos;
-    const bool woodBonus = rules.allowBirchMeadow && (birchCells || oldCells || meadowCells);
-    const bool cherryBonus = rules.allowCherry && cherryCells > 0;
+    /* "Basalt deltas" filter: the nether counterpart window must contain it.
+     * basalt_deltas is first in the ranking, so it heads the reported list. */
+    if (options.requireBasaltDeltas && !basalt)
+        return true;
     row.score = (basalt ? 1 : 0) + (woodBonus ? 1 : 0) + (cherryBonus ? 1 : 0);
     row.hasPinkPetals = cherryBonus ? 1 : 0;
     row.order = order;
@@ -519,7 +624,8 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     bool squareOnly,
     int frameStep,
     int threads,
-    FlowerSearchControl &control)
+    FlowerSearchControl &control,
+    const FlowerSearchOptions &options)
 {
     std::vector<FlowerRow> result;
     if (mc == MC_UNDEF)
@@ -591,15 +697,19 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
         return result;
     }
 
-    /* Phase 2 total: one unit per candidate plus one finalize unit
-     * (cluster / sort / copy), so the bar never sits at 100% while the
-     * tail still runs. */
+    /* Phase 3 (verification) total: one unit per candidate plus one finalize unit
+     * (sort / overlap dedupe / copy), so the bar never sits at 100% while the
+     * tail still runs. When an orientation is required, the other orientation's
+     * candidate list is not verified at all. Phase 2 is the merge/cluster tail
+     * that the climate screen reports through `stage` before this point. */
     const int phase1Total = std::max(1, loadInt(control.total));
-    const int candidateCount = nHits + nHitsZ;
-    const int phase2Total = candidateCount < INT_MAX ? candidateCount + 1 : INT_MAX;
-    const int overallTotal = phase1Total > INT_MAX - phase2Total
-        ? INT_MAX : phase1Total + phase2Total;
-    setPhase(control, 2, phase2Total);
+    const bool useXList = !dual || options.orientation != FLOWER_ORIENT_VERTICAL;
+    const bool useZList = dual && options.orientation != FLOWER_ORIENT_HORIZONTAL;
+    const int candidateCount = (useXList ? nHits : 0) + (useZList ? nHitsZ : 0);
+    const int phase3Total = candidateCount < INT_MAX ? candidateCount + 1 : INT_MAX;
+    const int overallTotal = phase1Total > INT_MAX - phase3Total
+        ? INT_MAX : phase1Total + phase3Total;
+    setPhase(control, 3, phase3Total);
     setOverall(control, phase1Total, overallTotal);
 
     Generator overworld{};
@@ -622,7 +732,7 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
         OutRow row;
         bool accepted = false;
         keep = considerHit(climate, overworld, nether, flowers, mc, rules, hit, winx, winz, orient, order,
-                           control, row, accepted);
+                           control, options, row, accepted);
         if (keep && accepted)
             rows.push_back(std::move(row));
         done++;
@@ -634,14 +744,20 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     {
         const char orientX = windowX >= windowZ ? 'X' : 'Z';
         const char orientZ = orientX == 'X' ? 'Z' : 'X';
-        for (int i = 0; i < nHits; i++)
-            take(hits[i], windowX, windowZ, orientX, i);
-        for (int i = 0; i < nHitsZ && keep; i++)
-            take(hitsZ[i], windowZ, windowX, orientZ, nHits + i);
+        if (useXList)
+        {
+            for (int i = 0; i < nHits && keep; i++)
+                take(hits[i], windowX, windowZ, orientX, i);
+        }
+        if (useZList)
+        {
+            for (int i = 0; i < nHitsZ && keep; i++)
+                take(hitsZ[i], windowZ, windowX, orientZ, nHits + i);
+        }
     }
     else
     {
-        for (int i = 0; i < nHits; i++)
+        for (int i = 0; i < nHits && keep; i++)
             take(hits[i], windowX, windowZ, 0, i);
     }
     std::free(hits);
@@ -649,27 +765,15 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     if (!keep)
         return result;
 
-    /* Candidates are done; keep one phase-2 unit for the finalize step. */
+    /* Candidates are done; keep one phase-3 unit for the finalize step. */
     setPhaseCurrent(control, candidateCount);
     setOverall(control, phase1Total + candidateCount, overallTotal);
-    if (!clusterVerifiedRows(rows, rules.clusterBlocks, control))
-        return result;
-    if (!pauseOk(control))
-        return result;
 
-    /* Same rule as GUI Sort: cherry first, then nearer to origin. */
-    std::sort(rows.begin(), rows.end(), [](const OutRow &a, const OutRow &b) {
-        if (a.hasPinkPetals != b.hasPinkPetals)
-            return a.hasPinkPetals > b.hasPinkPetals;
-        const int64_t da = originDist2(a), db = originDist2(b);
-        if (da != db)
-            return da < db;
-        if (a.qx != b.qx)
-            return a.qx < b.qx;
-        if (a.qz != b.qz)
-            return a.qz < b.qz;
-        return a.order < b.order;
-    });
+    /* Same rule as GUI Sort: cherry first, then nearer to origin. Sorting before
+     * de-duplication lets the preferred window win each overlap. */
+    std::sort(rows.begin(), rows.end(), rowPreferred);
+    if (!dedupeOverlappingWindows(rows, control))
+        return result;
     if (!pauseOk(control))
         return result;
 
@@ -677,7 +781,7 @@ std::vector<FlowerRow> runFlowerFarmSearchRows(
     for (const OutRow &row : rows)
         result.push_back(static_cast<const FlowerRow &>(row));
 
-    setPhaseCurrent(control, phase2Total);
+    setPhaseCurrent(control, phase3Total);
     setOverall(control, overallTotal, overallTotal);
     return result;
 }
@@ -694,13 +798,14 @@ std::vector<std::string> runFlowerFarmSearch(
     bool squareOnly,
     int frameStep,
     int threads,
-    FlowerSearchControl &control)
+    FlowerSearchControl &control,
+    const FlowerSearchOptions &options)
 {
     const int effectiveMc = mc == MC_UNDEF ? MC_NEWEST : mc;
     const VersionRules rules = rulesForMc(effectiveMc);
     const std::vector<FlowerRow> rows = runFlowerFarmSearchRows(
         seed, mc, minX, minZ, maxX, maxZ, longSide, shortSide, squareOnly,
-        frameStep, threads, control);
+        frameStep, threads, control, options);
     std::vector<std::string> lines;
     lines.reserve(rows.size());
     for (const FlowerRow &row : rows)

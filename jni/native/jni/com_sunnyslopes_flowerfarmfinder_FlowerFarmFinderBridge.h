@@ -10,10 +10,10 @@ extern "C" {
 /*
  * Class:     com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge
  * Method:    flowerSearch
- * Signature: (JIIIIIIIIILjava/lang/String;)[Ljava/lang/String;
+ * Signature: (JIIIIIIIIIIIIILjava/lang/String;)[Ljava/lang/String;
  */
 JNIEXPORT jobjectArray JNICALL Java_com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge_flowerSearch
-  (JNIEnv *, jclass, jlong, jint, jint, jint, jint, jint, jint, jint, jint, jint, jstring);
+  (JNIEnv *, jclass, jlong, jint, jint, jint, jint, jint, jint, jint, jint, jint, jint, jint, jint, jint, jstring);
 
 /*
  * Class:     com_sunnyslopes_flowerfarmfinder_FlowerFarmFinderBridge
