@@ -26,6 +26,10 @@ Two tabs: **Single Seed Search** and **Search from Seed List**.
 
 两个标签页：**单种子搜索**与**多种子列表搜索**。
 
+- The settings column of both tabs scrolls vertically when the window is short (long hints wrap instead of covering other controls); **Start / Pause / Stop** and the progress area stay pinned below the scroll area, so they are always reachable.
+
+- 两个标签页的左侧设置栏在窗口较矮时可上下滚动（较长的说明文字会自动换行，不再遮挡其他控件）；**开始 / 暂停 / 停止** 与进度区域固定在滚动区下方，始终可见。
+
 Both tabs share **Fast Mode** (on by default) and **Game Version**:
 
 两个标签页均有**快速模式**（默认勾选）和**游戏版本**：

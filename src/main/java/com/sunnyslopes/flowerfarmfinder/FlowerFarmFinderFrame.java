@@ -623,8 +623,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         JPanel mainPanel = new JPanel(new BorderLayout());
         mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // 左侧：输入和进度
-        JPanel leftPanel = new JPanel(new BorderLayout());
+        // 左侧：可滚动的设置区 + 固定的按钮/进度区
 
         // 输入区域
         JPanel inputPanel = new JPanel(new GridBagLayout());
@@ -970,17 +969,14 @@ public class FlowerFarmFinderFrame extends JFrame {
         buttonPanel.add(searchResetButton);
         buttonPanel.add(searchResetToWorldBorderButton);
 
-        // Static credit text above buttons
-        JPanel creditPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        // Hints / credit block.  BorderLayout (instead of FlowLayout) lets the
+        // HTML label wrap to the viewport width, so long hints never force a
+        // wider, clipped column.
+        JPanel creditPanel = new JPanel(new BorderLayout());
         creditPanel.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
         searchCreditLabel = new JLabel(buildCreditText());
         searchCreditLabel.setFont(getLoadedFont());
-        creditPanel.add(searchCreditLabel);
-
-        // 将 credit 和按钮放在一个容器中，credit 在上，按钮在下
-        JPanel creditButtonPanel = new JPanel(new BorderLayout());
-        creditButtonPanel.add(creditPanel, BorderLayout.NORTH);
-        creditButtonPanel.add(buttonPanel, BorderLayout.SOUTH);
+        creditPanel.add(searchCreditLabel, BorderLayout.CENTER);
 
         // 进度区域
         JPanel progressPanel = new JPanel(new GridBagLayout());
@@ -1007,15 +1003,26 @@ public class FlowerFarmFinderFrame extends JFrame {
         searchRemainingTimeLabel = new JLabel(getString("remainingTime.calculating"));
         progressPanel.add(searchRemainingTimeLabel, pgc);
 
-        leftPanel.add(inputPanel, BorderLayout.NORTH);
-        leftPanel.add(creditButtonPanel, BorderLayout.CENTER);
+        // Settings column: inputs + hints scroll vertically; the action buttons
+        // and the progress area are pinned below the viewport, so a long hint
+        // list can never cover or push away Start / Pause / Stop.
+        JPanel scrollContent = new ScrollablePanel(new BorderLayout());
+        scrollContent.add(inputPanel, BorderLayout.NORTH);
+        scrollContent.add(creditPanel, BorderLayout.CENTER);
 
-        // Progress area in separate container (credit merged into label above)
+        JScrollPane settingsScroll = new JScrollPane(scrollContent,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        settingsScroll.setBorder(null);
+        settingsScroll.getVerticalScrollBar().setUnitIncrement(16);
+        settingsScroll.setPreferredSize(new Dimension(700, 600));
+
         JPanel leftBottomPanel = new JPanel(new BorderLayout());
-        leftBottomPanel.add(progressPanel, BorderLayout.NORTH);
+        leftBottomPanel.add(buttonPanel, BorderLayout.NORTH);
+        leftBottomPanel.add(progressPanel, BorderLayout.CENTER);
 
         JPanel leftContainer = new JPanel(new BorderLayout());
-        leftContainer.add(leftPanel, BorderLayout.CENTER);
+        leftContainer.add(settingsScroll, BorderLayout.CENTER);
         leftContainer.add(leftBottomPanel, BorderLayout.SOUTH);
 
         // 右侧：结果显示
@@ -1706,8 +1713,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         JPanel mainPanel = new JPanel(new BorderLayout());
         mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // 左侧：输入和进度
-        JPanel leftPanel = new JPanel(new BorderLayout());
+        // 左侧：可滚动的设置区 + 固定的按钮/进度区
 
         // 输入区域
         JPanel inputPanel = new JPanel(new GridBagLayout());
@@ -2027,17 +2033,12 @@ public class FlowerFarmFinderFrame extends JFrame {
         buttonPanel.add(listSearchStopButton);
         buttonPanel.add(listSearchResetButton);
 
-        // Static credit text above buttons
-        JPanel creditPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        // Hints / credit block: wraps to the viewport width (see single-seed tab).
+        JPanel creditPanel = new JPanel(new BorderLayout());
         creditPanel.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
         listSearchCreditLabel = new JLabel(buildCreditText());
         listSearchCreditLabel.setFont(getLoadedFont());
-        creditPanel.add(listSearchCreditLabel);
-
-        // 将 credit 和按钮放在一个容器中，credit 在上，按钮在下
-        JPanel creditButtonPanel = new JPanel(new BorderLayout());
-        creditButtonPanel.add(creditPanel, BorderLayout.NORTH);
-        creditButtonPanel.add(buttonPanel, BorderLayout.SOUTH);
+        creditPanel.add(listSearchCreditLabel, BorderLayout.CENTER);
 
         // 进度区域
         JPanel progressPanel = new JPanel(new GridBagLayout());
@@ -2069,15 +2070,24 @@ public class FlowerFarmFinderFrame extends JFrame {
         listSearchRemainingTimeLabel = new JLabel(getString("remainingTime.calculating"));
         progressPanel.add(listSearchRemainingTimeLabel, pgc);
 
-        leftPanel.add(inputPanel, BorderLayout.NORTH);
-        leftPanel.add(creditButtonPanel, BorderLayout.CENTER);
+        // Settings column: inputs + hints scroll; buttons and progress stay pinned.
+        JPanel scrollContent = new ScrollablePanel(new BorderLayout());
+        scrollContent.add(inputPanel, BorderLayout.NORTH);
+        scrollContent.add(creditPanel, BorderLayout.CENTER);
 
-        // Progress area in separate container (credit merged into label above)
+        JScrollPane settingsScroll = new JScrollPane(scrollContent,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        settingsScroll.setBorder(null);
+        settingsScroll.getVerticalScrollBar().setUnitIncrement(16);
+        settingsScroll.setPreferredSize(new Dimension(700, 600));
+
         JPanel leftBottomPanel = new JPanel(new BorderLayout());
+        leftBottomPanel.add(buttonPanel, BorderLayout.NORTH);
         leftBottomPanel.add(progressPanel, BorderLayout.CENTER);
 
         JPanel leftContainer = new JPanel(new BorderLayout());
-        leftContainer.add(leftPanel, BorderLayout.CENTER);
+        leftContainer.add(settingsScroll, BorderLayout.CENTER);
         leftContainer.add(leftBottomPanel, BorderLayout.SOUTH);
 
         // 右侧：结果显示
@@ -3463,6 +3473,44 @@ public class FlowerFarmFinderFrame extends JFrame {
             } catch (IOException e) {
                 JOptionPane.showMessageDialog(this, getString("error.exportFailed", e.getMessage()), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
             }
+        }
+    }
+
+    /**
+     * Content panel for the settings scroll pane.
+     *
+     * Tracking the viewport width lets the HTML hint label wrap instead of
+     * widening the column, while the natural height is kept so the vertical
+     * scrollbar appears when the window is shorter than the settings block.
+     */
+    private static final class ScrollablePanel extends JPanel implements Scrollable {
+        ScrollablePanel(LayoutManager layout) {
+            super(layout);
+        }
+
+        @Override
+        public Dimension getPreferredScrollableViewportSize() {
+            return getPreferredSize();
+        }
+
+        @Override
+        public int getScrollableUnitIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return 16;
+        }
+
+        @Override
+        public int getScrollableBlockIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return Math.max(16, visibleRect.height - 32);
+        }
+
+        @Override
+        public boolean getScrollableTracksViewportWidth() {
+            return true;
+        }
+
+        @Override
+        public boolean getScrollableTracksViewportHeight() {
+            return false;
         }
     }
 
