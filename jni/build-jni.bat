@@ -28,12 +28,12 @@ cd /d "%MASTER%"
 set INC=%JAVA_HOME%\include
 set INCW=%JAVA_HOME%\include\win32
 rem -I. so #include "cubiomes/..." resolves to jni/cubiomes
-set CDEF=-DNDEBUG -D_WIN32 -DDRIPSTONECAVE_FINDER_JNI_LIB -I. -I"%INC%" -I"%INCW%"
+set CDEF=-DNDEBUG -D_WIN32 -I. -I"%INC%" -I"%INCW%"
 rem pre_cubiomes.h avoids C++20 std::lerp clash without copying cubiomes sources
 set CXXDEF=%CDEF% -I"%CUB%" -I"%CTS%" -include cxx_compat/pre_cubiomes.h
 
 del /q *.o bridge.o 2>nul
-rem Core biome/noise only (no finders/quadbase/loot — unused by cave search)
+rem Core biome/noise only (no finders/quadbase/loot — unused by the flower search)
 gcc -std=c17 -O3 %CDEF% -c "%CUB%\generator.c" "%CUB%\layers.c" "%CUB%\biomenoise.c" "%CUB%\biomes.c" "%CUB%\noise.c" "%CUB%\util.c"
 if errorlevel 1 exit /b 1
 gcc -std=c17 -O3 -fopenmp -I"%CTS%" -I"%CUB%" -c "%CTS%\climate.c" "%CTS%\engine.c" "%CTS%\biome.c"

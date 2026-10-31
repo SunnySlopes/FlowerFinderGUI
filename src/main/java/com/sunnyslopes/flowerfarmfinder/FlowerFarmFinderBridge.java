@@ -73,7 +73,7 @@ public final class FlowerFarmFinderBridge {
     private static boolean tryLoadSingleBundledResource(String resourcePath, String libName) {
         try (InputStream is = FlowerFarmFinderBridge.class.getResourceAsStream(resourcePath)) {
             if (is == null) return false;
-            Path tempDir = Files.createTempDirectory("lowydripstonecavefinder-native-");
+            Path tempDir = Files.createTempDirectory("flowerfarmfinder-native-");
             Path tempLib = tempDir.resolve(libName);
             Files.copy(is, tempLib, StandardCopyOption.REPLACE_EXISTING);
             tempLib.toFile().deleteOnExit();

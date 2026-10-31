@@ -1268,7 +1268,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         searchResultArea.setText(sb.toString());
     }
 
-    // 搜索相关方法（河流多阶段搜索）
+    // 搜索相关方法（多阶段全花搜索）
     private void startSearch() {
         if (isSearchRunning && isSearchPaused) {
             if (searchRunner != null) {
@@ -1515,7 +1515,7 @@ public class FlowerFarmFinderFrame extends JFrame {
             if (searchShortSideCheckBox != null) searchShortSideCheckBox.setEnabled(false);
             if (!searchRunner.startFlowerSearch(seed, minX, maxX, minZ, maxZ, longSide, shortSide, squareOnly,
                 threadCount, fastMode, bothWildflowers, basaltDeltas, orientation, flowerCenterMargin, mcVersion,
-                info -> updateCaveSearchProgress(resultToken, info),
+                info -> updateSearchProgress(resultToken, info),
                 line -> addSearchResult(resultToken, line))) {
                 isSearchRunning = false;
                 enableSearchControls();
@@ -2130,7 +2130,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         return mainPanel;
     }
 
-    private void updateCaveSearchProgress(long resultToken, FlowerFarmFinderSearchRunner.ProgressInfo info) {
+    private void updateSearchProgress(long resultToken, FlowerFarmFinderSearchRunner.ProgressInfo info) {
         SwingUtilities.invokeLater(() -> {
             if (resultToken != singleSearchResultToken.get()) {
                 return;
@@ -2801,7 +2801,7 @@ public class FlowerFarmFinderFrame extends JFrame {
         return seeds;
     }
 
-    // 列表搜索（河流多阶段，多种子顺序执行）
+    // 列表搜索（多阶段，多种子顺序执行）
     private void startListSearch() {
         if (isListSearchRunning && isListSearchPaused) {
             if (listSearchRunner != null) {
