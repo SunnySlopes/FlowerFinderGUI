@@ -10,9 +10,9 @@ The search runs in two stages: a CTS (Climate Transition Search) climate-noise s
 
 ## Module Contents / 模块内容
 
-This repository is the GUI module of Flower Farm Finder. It contains only the flower-farm search pipeline — river / karst-cave finder code is not part of this module.
+This repository is the **GUI** of Flower Farm Finder. All C++ compute logic (CTS climate-transition search, flower-farm verification, cubiomes) lives in the [`FlowerFinderBase`](https://github.com/SunnySlopes/FlowerFinderBase) submodule — this repository only keeps the Swing UI and the JNI bridge class.
 
-本仓库是 Flower Farm Finder 的 GUI 模块，只包含全花农场搜索流程——不包含河流 / 溶洞查找相关代码。
+本仓库是 Flower Farm Finder 的 **GUI**；全部 C++ 计算逻辑（CTS 气候过渡搜索、全花农场校验、cubiomes）都在 `FlowerFinderBase` 子模块里，本仓库只保留 Swing 界面与 JNI 桥接类。
 
 | Path / 路径 | Contents / 内容 |
 |---|---|
@@ -20,12 +20,8 @@ This repository is the GUI module of Flower Farm Finder. It contains only the fl
 | `src/main/java/com/sunnyslopes/flowerfarmfinder/FlowerFarmFinderSearchRunner.java` | Search lifecycle, progress polling, ETA / 搜索生命周期、进度与剩余时间 |
 | `src/main/java/com/sunnyslopes/flowerfarmfinder/FlowerFarmFinderBridge.java` | JNI bridge and native-library loading / JNI 桥接与原生库加载 |
 | `src/main/resources/` | i18n (`messages_*.properties`), font, icon, logging / 国际化、字体、图标与日志 |
-| `jni/FlowerFarmSearch.cpp` / `.h` | Native flower-farm search (CTS + verification) / 原生全花搜索（CTS + 校验） |
-| `jni/native/jni/` | JNI entry points / JNI 入口 |
-| `jni/cts/` | CTS 1.0.0 climate-transition sources / CTS 1.0.0 气候过渡源码 |
-| `jni/cubiomes/` | cubiomes submodule (biome / noise) / cubiomes 子模块（群系 / 噪声） |
-| `jni/build-jni.bat` | Windows native build / Windows 原生库构建 |
-| `native/windows/` | Prebuilt DLL packaged into the JAR / 打包进 JAR 的预编译 DLL |
+| `FlowerFinderBase/` | Submodule: core search library, cubiomes, JNI DLL and a standalone CLI / 子模块：核心搜索库、cubiomes、JNI DLL 与独立命令行 |
+| `build.gradle` | Builds the submodule DLL, then packages GUI + native library into the fat JAR / 先编子模块 DLL，再把界面与原生库一起打进 fat jar |
 
 ## Requirements and Run / 运行要求
 
@@ -34,7 +30,7 @@ This repository is the GUI module of Flower Farm Finder. It contains only the fl
 **此程序需要 Java 17 或更高版本。**
 
 ```bat
-java -jar build\libs\FlowerFarmFinder-1.0.3.jar
+java -jar build\libs\FlowerFarmFinder-1.0.4.jar
 ```
 
 Or right-click the `.jar`, choose **Open with**, and select **Java 17+**.
@@ -202,47 +198,64 @@ Fast mode trades a little completeness for speed. Phase 3 is often the largest c
 
 ## Build / 构建
 
-**Java JAR**
+The native search library comes from the **FlowerFinderBase** submodule. Initialize both levels first:
+
+原生搜索库来自 **FlowerFinderBase** 子模块，首次构建前先初始化两层子模块：
+
+```bat
+git submodule update --init --recursive
+```
+
+**Java JAR (+ native library)**
 
 ```bat
 .\gradlew.bat buildMainJar
 ```
 
-Or, with a local Gradle installation:
+Or, with a local Gradle installation / 或使用本地 Gradle：
 
 ```bat
 gradle buildMainJar
 ```
 
-The fat JAR is written to `build\libs\FlowerFarmFinder-1.0.3.jar`.
+When `FlowerFinderBase` is present and its `cubiomes` submodule is populated, `buildMainJar` runs
+`FlowerFinderBase\jni\build-jni.bat` (MSYS2 UCRT64 `gcc` / `g++` / `cmake` / `ninja` + a JDK with
+`include/jni.h`), then packages the resulting DLL and the Java classes into
+`build\libs\FlowerFarmFinder-1.0.4.jar`.
 
-**Windows native library**
+`FlowerFinderBase` 子模块就绪（含 `cubiomes`）时，`buildMainJar` 会先调用
+`FlowerFinderBase\jni\build-jni.bat` 编译 DLL（需要 MSYS2 UCRT64 的 `gcc` / `g++` / `cmake` / `ninja`
+与带 `include/jni.h` 的 JDK），再把 DLL 与 Java 类一起打进
+`build\libs\FlowerFarmFinder-1.0.4.jar`。
 
-`buildMainJar` can compile the JNI DLL via `jni/build-jni.bat`. This needs a JDK with `include/jni.h` and MSYS2 UCRT64 `gcc` / `g++` on `PATH` (the script also prepends `C:\msys64\ucrt64\bin`).
+If the submodule is missing, the JAR is still built but without the native library (the GUI then
+reports that the native library could not be loaded).
 
-Windows 下 `buildMainJar` 可通过 `jni/build-jni.bat` 编译 JNI DLL，需要带 `include/jni.h` 的 JDK，以及 PATH 中的 MSYS2 UCRT64 `gcc` / `g++`（脚本也会把 `C:\msys64\ucrt64\bin` 加到 PATH 前面）。
+子模块缺失时 JAR 仍可构建，但里面没有原生库（运行时 GUI 会提示原生库加载失败）。
 
-Build the native library alone / 也可单独编译 native：
+**Standalone library / CLI**
+
+The core library can be built, packaged and run without this GUI — see
+<https://github.com/SunnySlopes/FlowerFinderBase>:
+
+核心库可以完全脱离 GUI 独立构建、打包与运行，用法见
+<https://github.com/SunnySlopes/FlowerFinderBase>：
 
 ```bat
-jni\build-jni.bat
-```
-
-The DLL is copied to `native/windows/libFlowerFarmFinderLibJ.dll` and packaged into the JAR by `prepareNativeResources`.
-
-DLL 会复制到 `native/windows/libFlowerFarmFinderLibJ.dll`，并由 `prepareNativeResources` 打入 JAR。
-
-Initialize the cubiomes submodule if needed / 如需初始化 cubiomes 子模块：
-
-```bat
-git submodule update --init jni/cubiomes
+cd FlowerFinderBase
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+.\build\bin\FlowerFinderBase-cli.exe --seed 24 --out flower.txt
 ```
 
 ## Core Libraries / 核心依赖
 
-- [cubiomes](https://github.com/Cubitect/cubiomes) — via `jni/cubiomes` (biome / climate noise)
-- CTS 1.0.0 sources under `jni/cts/` — climate-transition window search
+- [FlowerFinderBase](https://github.com/SunnySlopes/FlowerFinderBase) — submodule with the whole
+  native search: CTS 1.0.0 sources, flower-farm verification and the
+  [cubiomes](https://github.com/xpple/cubiomes) submodule (biome / climate noise)
 - Authors / 作者：SunnySlopes & M33 Galaxy
+
+子模块 `FlowerFinderBase` 提供全部原生搜索代码：CTS 1.0.0、全花农场校验，以及
+[cubiomes](https://github.com/xpple/cubiomes) 子模块（群系 / 气候噪声）。
 
 ## Notes / 注意事项
 
@@ -251,14 +264,14 @@ git submodule update --init jni/cubiomes
 - The output is deterministic: candidates are merged and sorted with a total order, so thread count does not change the result set.
 - Fast mode may return slightly fewer windows than precise mode. Use precise mode when completeness matters more than speed.
 - Native libraries (`dll` / `so` / `dylib`) are packaged in the JAR and extracted to a temp directory at runtime.
-- To refresh the Windows native library: rebuild with `jni/build-jni.bat` (overwrites `native/windows/libFlowerFarmFinderLibJ.dll`).
+- To refresh the Windows native library, rebuild it in the submodule (`FlowerFinderBase\jni\build-jni.bat`) or just re-run `buildMainJar`; there is no checked-in DLL any more.
 
 - 建议按 CPU 能力设置线程数；候选校验已并行化，因此气候粗筛结束后提高线程数仍然有效。
 - 原生库加载时会设置 `GOMP_SPINCOUNT=0` / `OMP_WAIT_POLICY=passive`（若你已设置则保留你的值），避免 OpenMP 空闲线程在串行收尾（排序 / 去重）和界面线程上自旋。
 - 输出是确定的：候选先合并再按全序排序，因此线程数不会改变结果集。
 - 快速模式可能比精确模式少返回少量窗口。更看重完整性时请使用精确模式。
 - 原生库（`dll` / `so` / `dylib`）已打包进 JAR，运行时解压到临时目录加载。
-- 更新 Windows 原生库：运行 `jni\build-jni.bat`（覆盖 `native/windows/libFlowerFarmFinderLibJ.dll`）。
+- 更新 Windows 原生库：在子模块里重新构建（`FlowerFinderBase\jni\build-jni.bat`），或直接重跑 `buildMainJar`；仓库里不再保存预编译 DLL。
 
 ---
 

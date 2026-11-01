@@ -7,7 +7,7 @@ plugins {
     id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 group 'org.example'
-version '1.0.3'
+version '1.0.4'
 repositories {
     mavenCentral()
     gradlePluginPortal()
@@ -40,7 +40,31 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
-// 普通 jar 与 shadowJar 都输出 FlowerFarmFinder-1.0.0.jar，必须都带入口类，
+// ---------------------------------------------------------------------------
+// 本仓库只保留 Java GUI；全部 C++ 计算逻辑（CTS + FlowerFarmSearch + cubiomes）
+// 在 FlowerFinderBase 子模块里（https://github.com/SunnySlopes/FlowerFinderBase）。
+//
+// 契约：
+//   FlowerFinderBase/build/bin/libFlowerFarmFinderLibJ.dll
+//     -> jar 内 /native/windows/libFlowerFarmFinderLibJ.dll
+//   由 FlowerFinderBase/jni/build-jni.bat 构建，JNI 类/方法签名不变
+//   （com.sunnyslopes.flowerfarmfinder.FlowerFarmFinderBridge）。
+//
+// 子模块就绪时：先编 base 的 DLL，再和 Java 代码一起打进 fat jar。
+// 子模块未初始化时：跳过原生库，jar 仍然可以构建（运行时 GUI 会报缺少原生库）。
+// ---------------------------------------------------------------------------
+def baseDir = file('FlowerFinderBase')
+def baseCmake = new File(baseDir, 'CMakeLists.txt')
+def basePresent = baseDir.isDirectory() && baseCmake.isFile()
+def baseCubiomes = new File(baseDir, 'cubiomes/generator.c')
+def baseJniBat = new File(baseDir, 'jni/build-jni.bat')
+def baseBinDir = new File(baseDir, 'build/bin')
+def baseDll = new File(baseBinDir, 'libFlowerFarmFinderLibJ.dll')
+def generatedNativeResourcesDir = layout.buildDirectory.dir('generated/native-resources')
+
+def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+
+// 普通 jar 与 shadowJar 都输出 FlowerFarmFinder-*.jar，必须都带入口类，
 // 否则后执行的任务会盖掉带 Main-Class 的包。
 jar {
     archiveBaseName.set('FlowerFarmFinder')
@@ -64,10 +88,94 @@ shadowJar {
     }
 }
 
+tasks.register('buildNativeWindows', Exec) {
+    group = 'build'
+    description = 'Builds libFlowerFarmFinderLibJ.dll from the FlowerFinderBase submodule'
+    workingDir = new File(baseDir, 'jni')
+    commandLine 'cmd', '/c', 'build-jni.bat'
+    // build-jni.bat 自己会找 JDK；这里优先把 Gradle 正在用的 JDK 传过去。
+    def runningJavaHome = System.getProperty('java.home')
+    if (file("${runningJavaHome}/include/jni.h").exists()) {
+        environment 'JAVA_HOME', runningJavaHome
+    }
+    onlyIf {
+        // 只有在 Windows 且子模块连接正确时才构建原生库
+        isWindows && basePresent && baseCubiomes.isFile() && baseJniBat.isFile()
+    }
+    inputs.files(fileTree(baseDir) {
+        include 'CMakeLists.txt', 'build.ps1'
+        include 'src/**', 'include/**', 'cts/**', 'cxx_compat/**'
+        include 'jni/*.cpp', 'jni/*.h', 'jni/*.bat'
+        include 'cubiomes/*.c', 'cubiomes/*.h', 'cubiomes/tables/**'
+        exclude 'build/**'
+    })
+    outputs.file(baseDll)
+}
+
+tasks.register('prepareNativeResources') {
+    group = 'build'
+    description = 'Collects the prebuilt native library from FlowerFinderBase into jar resources'
+    dependsOn tasks.named('buildNativeWindows')
+    outputs.dir(generatedNativeResourcesDir)
+    doLast {
+        def outDir = generatedNativeResourcesDir.get().asFile
+        delete(outDir)
+        outDir.mkdirs()
+
+        if (!basePresent) {
+            logger.warn(
+                'FlowerFinderBase submodule is not initialized: the jar will NOT contain ' +
+                'the native search library. Run "git submodule update --init --recursive".')
+            return
+        }
+        if (!baseCubiomes.isFile()) {
+            logger.warn(
+                'FlowerFinderBase/cubiomes submodule is not initialized: the jar will NOT ' +
+                'contain the native search library. Run "git submodule update --init --recursive".')
+            return
+        }
+
+        // 优先使用本次构建产出的 DLL；也接受 base 仓库里已经构建好的产物。
+        if (isWindows) {
+            if (!baseDll.isFile()) {
+                throw new GradleException(
+                    "Missing ${baseDll}. Build it with: FlowerFinderBase\\jni\\build-jni.bat")
+            }
+            copy {
+                from(baseBinDir)
+                include('*.dll')
+                into(new File(outDir, 'native/windows'))
+            }
+        }
+        // 其他平台：若 base 里已有对应产物（例如在 Linux/macOS 上预先构建），一并打包。
+        def linuxDir = new File(baseBinDir, 'native/linux')
+        if (linuxDir.isDirectory()) {
+            copy {
+                from(linuxDir)
+                include('*.so')
+                into(new File(outDir, 'native/linux'))
+            }
+        }
+        def macosDir = new File(baseBinDir, 'native/macos')
+        if (macosDir.isDirectory()) {
+            copy {
+                from(macosDir)
+                include('*.dylib')
+                into(new File(outDir, 'native/macos'))
+            }
+        }
+    }
+}
+
+tasks.named('processResources') {
+    dependsOn tasks.named('prepareNativeResources')
+    from(generatedNativeResourcesDir)
+}
+
 // 创建 FlowerFarmFinder 的可执行 JAR
 tasks.register('buildMainJar', ShadowJar) {
     group = 'build'
-    description = 'Creates a fat JAR for FlowerFarmFinder'
+    description = 'Creates a fat JAR for FlowerFarmFinder (GUI + FlowerFinderBase native library)'
     archiveBaseName.set('FlowerFarmFinder')
     archiveClassifier.set('')
     from sourceSets.main.output
@@ -88,94 +196,13 @@ tasks.register('buildMainJar', ShadowJar) {
     exclude 'module-info.class'
 }
 
+tasks.named('buildMainJar') {
+    dependsOn tasks.named('prepareNativeResources')
+}
+
 // 创建所有 JAR 的任务
 tasks.register('buildAllJars') {
     group = 'build'
     description = 'Builds all executable JARs'
     dependsOn buildMainJar
-}
-
-// Prebuilt native libraries: buildMainJar triggers Windows JNI build when possible.
-def generatedNativeResourcesDir = layout.buildDirectory.dir('generated/native-resources')
-def windowsDll = file('native/windows/libFlowerFarmFinderLibJ.dll')
-def jniBat = file('jni/build-jni.bat')
-
-tasks.register('buildNativeWindows', Exec) {
-    group = 'build'
-    description = 'Builds libFlowerFarmFinderLibJ.dll via jni/build-jni.bat'
-    workingDir = file('jni')
-    commandLine 'cmd', '/c', 'build-jni.bat'
-    def runningJavaHome = System.getProperty('java.home')
-    if (file("${runningJavaHome}/include/jni.h").exists()) {
-        environment 'JAVA_HOME', runningJavaHome
-    }
-    onlyIf {
-        System.getProperty('os.name').toLowerCase().contains('windows') && jniBat.exists()
-    }
-    inputs.files(
-        fileTree('jni') {
-            include 'FlowerFarmSearch.cpp', 'FlowerFarmSearch.h',
-                    'build-jni.bat',
-                    'cts/*.{c,h}',
-                    'cxx_compat/*.h',
-                    'native/jni/**/*.cpp', 'native/jni/**/*.h',
-                    'cubiomes/generator.{c,h}', 'cubiomes/layers.{c,h}',
-                    'cubiomes/biomenoise.{c,h}', 'cubiomes/biomes.{c,h}',
-                    'cubiomes/noise.{c,h}', 'cubiomes/util.{c,h}',
-                    'cubiomes/rng.h', 'cubiomes/xrms.h', 'cubiomes/tables/*.h'
-        }
-    )
-    outputs.file(windowsDll)
-}
-
-tasks.register('prepareNativeResources') {
-    group = 'build'
-    description = 'Collects prebuilt dll/so/dylib from native/ into jar resources'
-    dependsOn tasks.named('buildNativeWindows')
-    inputs.files(windowsDll)
-    outputs.dir(generatedNativeResourcesDir)
-    doLast {
-        def outDir = generatedNativeResourcesDir.get().asFile
-        delete(outDir)
-        outDir.mkdirs()
-
-        def windowsDir = file('native/windows')
-        def linuxDir = file('native/linux')
-        def macosDir = file('native/macos')
-
-        if (!windowsDll.exists()) {
-            throw new GradleException(
-                'Missing native/windows/libFlowerFarmFinderLibJ.dll. ' +
-                'Run jni/build-jni.bat (uses jni/cubiomes).')
-        }
-
-        copy {
-            from(windowsDir)
-            include('*.dll')
-            into(new File(outDir, 'native/windows'))
-        }
-        if (linuxDir.exists()) {
-            copy {
-                from(linuxDir)
-                include('*.so')
-                into(new File(outDir, 'native/linux'))
-            }
-        }
-        if (macosDir.exists()) {
-            copy {
-                from(macosDir)
-                include('*.dylib')
-                into(new File(outDir, 'native/macos'))
-            }
-        }
-    }
-}
-
-tasks.named('processResources') {
-    dependsOn tasks.named('prepareNativeResources')
-    from(generatedNativeResourcesDir)
-}
-
-tasks.named('buildMainJar') {
-    dependsOn tasks.named('prepareNativeResources')
 }

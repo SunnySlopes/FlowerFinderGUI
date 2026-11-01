@@ -35,12 +35,12 @@ public final class FlowerFarmFinderBridge {
                 return;
             }
 
-            // Fallback: try build output directory
+            // Fallback: try the FlowerFinderBase submodule build output
             Path base = Paths.get(System.getProperty("user.dir", "."));
             List<String> libNames = getNativeLibNamesForCurrentOs();
             Path[] candidates = {
+                base.resolve("FlowerFinderBase").resolve("build").resolve("bin"),
                 base.resolve("native"),
-                base.resolve("jni").resolve("native").resolve("jni").resolve("build"),
                 base.resolve("build").resolve("libs").resolve("native"),
             };
             for (Path dir : candidates) {
@@ -53,7 +53,9 @@ public final class FlowerFarmFinderBridge {
                     }
                 }
             }
-            throw new UnsatisfiedLinkError("FlowerFarmFinder native library not found. Build with: jni/build-jni.bat. " + firstError.getMessage());
+            throw new UnsatisfiedLinkError("FlowerFinderBase native library not found. " +
+                "Build it with FlowerFinderBase\\jni\\build-jni.bat (or run " +
+                "gradlew buildMainJar with the submodule initialized). " + firstError.getMessage());
         }
     }
 

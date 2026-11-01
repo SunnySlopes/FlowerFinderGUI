@@ -54,21 +54,7 @@ hs_err_pid*
 replay_pid*
 
 # Native / C++ build artifacts
-jni/build/
-jni/build-mingw/
-jni/native/jni/build/
-jni/**/*.o
-jni/**/*.a
-jni/**/*.obj
-jni/**/*.exe
-jni/**/*.dll
-jni/**/*.lib
-jni/**/*.pdb
-jni/**/*.ilk
-jni/**/*.exp
-jni/**/*.so
-jni/**/*.dylib
-
-# Prebuilt native libraries at repo root (produced by jni/build-jni.bat for Gradle JAR packaging)
-# Use leading slash so jni/native/ sources are still tracked.
-/native/
+# 全部 C++ 计算逻辑已移入 FlowerFinderBase 子模块（自带 .gitignore）：
+#   FlowerFinderBase/build/          CLI / DLL 构建产物
+#   FlowerFinderBase/cubiomes/       cubiomes 子模块
+# 本仓库不再跟踪任何原生库或目标文件。
