@@ -170,6 +170,8 @@ tasks.register('prepareNativeResources') {
 tasks.named('processResources') {
     dependsOn tasks.named('prepareNativeResources')
     from(generatedNativeResourcesDir)
+    // 分发物（普通 jar / fat jar）内附带 MIT 许可全文
+    from('LICENSE')
 }
 
 // 创建 FlowerFarmFinder 的可执行 JAR

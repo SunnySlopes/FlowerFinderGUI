@@ -273,6 +273,30 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - 原生库（`dll` / `so` / `dylib`）已打包进 JAR，运行时解压到临时目录加载。
 - 更新 Windows 原生库：在子模块里重新构建（`FlowerFinderBase\jni\build-jni.bat`），或直接重跑 `buildMainJar`；仓库里不再保存预编译 DLL。
 
+## License / 许可
+
+**MIT** — full text in [`LICENSE`](LICENSE).
+
+Both this GUI repository and the [`FlowerFinderBase`](https://github.com/SunnySlopes/FlowerFinderBase)
+submodule (the whole core search library, CLI and JNI bridge) are released under the MIT License, so
+the GUI and the library may be used, modified and redistributed freely, including commercially.
+
+本仓库（GUI）与 [`FlowerFinderBase`](https://github.com/SunnySlopes/FlowerFinderBase) 子模块
+（核心搜索库、CLI 与 JNI 桥）均以 **MIT 许可证**发布，可自由使用、修改与再分发（含商业用途）；
+完整文本见 [`LICENSE`](LICENSE)，子模块内另有一份 [`FlowerFinderBase/LICENSE`](FlowerFinderBase/LICENSE)。
+
+```text
+Copyright (c) 2026 SunnySlopes & M33 Galaxy
+```
+
+The bundled [cubiomes](https://github.com/xpple/cubiomes) submodule keeps its own upstream MIT
+license, Copyright (c) 2020 Cubitect — see `FlowerFinderBase/cubiomes/LICENSE` and
+[`FlowerFinderBase/THIRD_PARTY.md`](FlowerFinderBase/THIRD_PARTY.md).
+
+内置的 [cubiomes](https://github.com/xpple/cubiomes) 子模块保留其上游自带的 MIT 许可
+（Copyright (c) 2020 Cubitect），见 `FlowerFinderBase/cubiomes/LICENSE` 与
+[`FlowerFinderBase/THIRD_PARTY.md`](FlowerFinderBase/THIRD_PARTY.md)。
+
 ---
 
 **Find better full flower farm sites, faster.**
