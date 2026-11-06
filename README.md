@@ -260,14 +260,16 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ## Notes / 注意事项
 
 - Match the thread count to your CPU for stability; verification is parallel, so extra threads still help after the climate screen.
-- On load the native library sets `GOMP_SPINCOUNT=0` / `OMP_WAIT_POLICY=passive` unless you already set them. This stops idle OpenMP workers from spinning into the serial tail (sort / de-dup) and the UI.
+- The native library uses plain worker threads (`std::thread`), not OpenMP: no OpenMP runtime DLL and no `OMP_*` settings are needed.
+- The climate screen caches the whole coarse climate field (up to ~256 MB) so tiles don't rebuild it. On low-memory machines, set `FFB_FIELD_CACHE_MB` (MB, e.g. `64`) before launching to lower the cap; tiles then fall back to their own smaller fields.
 - The output is deterministic: candidates are merged and sorted with a total order, so thread count does not change the result set.
 - Fast mode may return slightly fewer windows than precise mode. Use precise mode when completeness matters more than speed.
 - Native libraries (`dll` / `so` / `dylib`) are packaged in the JAR and extracted to a temp directory at runtime.
 - To refresh the Windows native library, rebuild it in the submodule (`FlowerFinderBase\jni\build-jni.bat`) or just re-run `buildMainJar`; there is no checked-in DLL any more.
 
 - 建议按 CPU 能力设置线程数；候选校验已并行化，因此气候粗筛结束后提高线程数仍然有效。
-- 原生库加载时会设置 `GOMP_SPINCOUNT=0` / `OMP_WAIT_POLICY=passive`（若你已设置则保留你的值），避免 OpenMP 空闲线程在串行收尾（排序 / 去重）和界面线程上自旋。
+- 原生库使用普通工作线程（`std::thread`），不依赖 OpenMP：无需 OpenMP 运行时 DLL，也不用设置 `OMP_*` 环境变量。
+- 气候粗筛会缓存整块粗气候场（默认上限约 256 MB），避免每个分块重复构建；内存较小时可在启动前设置 `FFB_FIELD_CACHE_MB`（单位 MB，例如 `64`）降低上限，届时分块会各自构建较小的场。
 - 输出是确定的：候选先合并再按全序排序，因此线程数不会改变结果集。
 - 快速模式可能比精确模式少返回少量窗口。更看重完整性时请使用精确模式。
 - 原生库（`dll` / `so` / `dylib`）已打包进 JAR，运行时解压到临时目录加载。
