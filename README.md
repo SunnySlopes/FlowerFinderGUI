@@ -30,7 +30,7 @@ This repository is the **GUI** of Flower Farm Finder. All C++ compute logic (CTS
 **此程序需要 Java 17 或更高版本。**
 
 ```bat
-java -jar build\libs\FlowerFarmFinder-1.0.4.jar
+java -jar build\libs\FlowerFarmFinder-1.0.6.jar
 ```
 
 Or right-click the `.jar`, choose **Open with**, and select **Java 17+**.
@@ -221,12 +221,12 @@ gradle buildMainJar
 When `FlowerFinderBase` is present and its `cubiomes` submodule is populated, `buildMainJar` runs
 `FlowerFinderBase\jni\build-jni.bat` (MSYS2 UCRT64 `gcc` / `g++` / `cmake` / `ninja` + a JDK with
 `include/jni.h`), then packages the resulting DLL and the Java classes into
-`build\libs\FlowerFarmFinder-1.0.4.jar`.
+`build\libs\FlowerFarmFinder-1.0.6.jar`.
 
 `FlowerFinderBase` 子模块就绪（含 `cubiomes`）时，`buildMainJar` 会先调用
 `FlowerFinderBase\jni\build-jni.bat` 编译 DLL（需要 MSYS2 UCRT64 的 `gcc` / `g++` / `cmake` / `ninja`
 与带 `include/jni.h` 的 JDK），再把 DLL 与 Java 类一起打进
-`build\libs\FlowerFarmFinder-1.0.4.jar`。
+`build\libs\FlowerFarmFinder-1.0.6.jar`。
 
 If the submodule is missing, the JAR is still built but without the native library (the GUI then
 reports that the native library could not be loaded).
@@ -262,6 +262,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - Match the thread count to your CPU for stability; verification is parallel, so extra threads still help after the climate screen.
 - The native library uses plain worker threads (`std::thread`), not OpenMP: no OpenMP runtime DLL and no `OMP_*` settings are needed.
 - The climate screen caches the whole coarse climate field (up to ~256 MB) so tiles don't rebuild it. On low-memory machines, set `FFB_FIELD_CACHE_MB` (MB, e.g. `64`) before launching to lower the cap; tiles then fall back to their own smaller fields.
+- Ranges larger than 262,144 blocks on either side are searched in overlapping 262,144-block tiles to cap memory: the phase progress restarts for every tile, and such very large ranges may return a different (possibly smaller) window set than a single pass. Keep both sides at or below 262,144 for the classic behaviour; `FLOWER_TILE_SPAN` (65536–60000001 blocks) overrides the tile size.
 - The output is deterministic: candidates are merged and sorted with a total order, so thread count does not change the result set.
 - Fast mode may return slightly fewer windows than precise mode. Use precise mode when completeness matters more than speed.
 - Native libraries (`dll` / `so` / `dylib`) are packaged in the JAR and extracted to a temp directory at runtime.
@@ -270,6 +271,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - 建议按 CPU 能力设置线程数；候选校验已并行化，因此气候粗筛结束后提高线程数仍然有效。
 - 原生库使用普通工作线程（`std::thread`），不依赖 OpenMP：无需 OpenMP 运行时 DLL，也不用设置 `OMP_*` 环境变量。
 - 气候粗筛会缓存整块粗气候场（默认上限约 256 MB），避免每个分块重复构建；内存较小时可在启动前设置 `FFB_FIELD_CACHE_MB`（单位 MB，例如 `64`）降低上限，届时分块会各自构建较小的场。
+- 单边超过 262144 格的搜索范围会按带重叠的 262144 格分块串行处理以限制内存：每个分块都会重新开始阶段进度，并且这种超大范围的结果可能与一次性遍历不同（甚至更少）。希望得到与旧版一致的结果时，请让两边都 ≤ 262144；可用 `FLOWER_TILE_SPAN`（65536–60000001 格）调整分块大小。
 - 输出是确定的：候选先合并再按全序排序，因此线程数不会改变结果集。
 - 快速模式可能比精确模式少返回少量窗口。更看重完整性时请使用精确模式。
 - 原生库（`dll` / `so` / `dylib`）已打包进 JAR，运行时解压到临时目录加载。
