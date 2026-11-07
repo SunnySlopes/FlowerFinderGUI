@@ -618,6 +618,14 @@ public class FlowerFarmFinderFrame extends JFrame {
         }
     }
 
+    /** Message key for the short phase name shown in the tiled progress text. */
+    private static String stageNameKey(int phase) {
+        if (phase == PHASE_PREPARING) return "stage.prepare";
+        if (phase == PHASE_MERGE) return "stage.merge";
+        if (phase == PHASE_VERIFY) return "stage.verify";
+        return "stage.climate";
+    }
+
     // 创建单种子搜索面板
     private JPanel createSingleSeedSearchPanel() {
         JPanel mainPanel = new JPanel(new BorderLayout());
@@ -2157,22 +2165,35 @@ public class FlowerFarmFinderFrame extends JFrame {
             // numeric bar like the other phases; only an unknown phase is shown
             // as indeterminate.
             boolean unknownPhase = (phase == -1);
-            searchProgressBar.setIndeterminate(unknownPhase);
-            if (!unknownPhase) {
-                searchProgressBar.setValue((int) Math.min(100, info.percentage()));
+            if (info.tiled()) {
+                // Large ranges run as a tile sweep: the bar advances once per
+                // completed tile, the text names the phase of the running tile.
+                searchProgressBar.setIndeterminate(false);
+                searchProgressBar.setValue((int) Math.min(100.0, info.percentage()));
+                searchProgressBar.setString(getString("progress.tiled",
+                        info.tileIndex(), info.tileTotal(), getString(stageNameKey(phase))));
+            } else {
+                searchProgressBar.setIndeterminate(unknownPhase);
+                if (!unknownPhase) {
+                    searchProgressBar.setValue((int) Math.min(100, info.percentage()));
+                }
+                String stageKey = (phase == PHASE_PREPARING) ? "progress.stage0"
+                        : (phase == PHASE_MERGE) ? "progress.stage2"
+                        : (phase == PHASE_VERIFY) ? "progress.stage3" : "progress.stage1";
+                searchProgressBar.setString(unknownPhase
+                        ? getString(stageKey, 0, 0, 0.0)
+                        : getString(stageKey, info.processed(), info.total(), info.percentage()));
             }
-            String stageKey = (phase == PHASE_PREPARING) ? "progress.stage0"
-                    : (phase == PHASE_MERGE) ? "progress.stage2"
-                    : (phase == PHASE_VERIFY) ? "progress.stage3" : "progress.stage1";
-            searchProgressBar.setString(unknownPhase
-                    ? getString(stageKey, 0, 0, 0.0)
-                    : getString(stageKey, info.processed(), info.total(), info.percentage()));
 
             searchElapsedTimeLabel.setText(getString("elapsedTime", formatTime(info.elapsedMs())));
             if (isSearchPaused) {
-                searchRemainingTimeLabel.setText(info.nativePauseSettled()
-                        ? getString("remainingTime.paused")
-                        : getString("remainingTime.calculating"));
+                if (info.tiled() && info.pausePending()) {
+                    searchRemainingTimeLabel.setText(getString("remainingTime.pauseAfterTile"));
+                } else {
+                    searchRemainingTimeLabel.setText(info.nativePauseSettled()
+                            ? getString("remainingTime.paused")
+                            : getString("remainingTime.calculating"));
+                }
                 return;
             }
             if (unknownPhase) {
@@ -3140,6 +3161,14 @@ public class FlowerFarmFinderFrame extends JFrame {
                                 return;
                             }
                             if (isListSearchRunning) {
+                                // Tiled searches report block-level progress; the
+                                // label then names the tile and its current phase.
+                                if (info.tiled()) {
+                                    listSearchCurrentSeedProgressLabel.setText(getString("currentSeed.tiled",
+                                            currentSeedIndex, totalSeeds, info.tileIndex(), info.tileTotal(),
+                                            getString(stageNameKey(phase))));
+                                    return;
+                                }
                                 // Phase 2 reports its own counters (from 0).
                                 boolean unknownPhase = (phase == -1);
                                 String key = (phase == PHASE_MERGE || unknownPhase) ? "currentSeed.stage2"

@@ -116,6 +116,12 @@ tasks.register('prepareNativeResources') {
     group = 'build'
     description = 'Collects the prebuilt native library from FlowerFinderBase into jar resources'
     dependsOn tasks.named('buildNativeWindows')
+    // The native library is produced by another task; declare the binaries as
+    // inputs so a rebuilt DLL always replaces the copy in the jar resources
+    // (otherwise this task stays UP-TO-DATE and packages a stale DLL).
+    inputs.files(fileTree(baseBinDir) {
+        include '*.dll', '*.so', '*.dylib'
+    })
     outputs.dir(generatedNativeResourcesDir)
     doLast {
         def outDir = generatedNativeResourcesDir.get().asFile

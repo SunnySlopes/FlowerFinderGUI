@@ -93,10 +93,16 @@ public class FlowerFarmFinderSearchRunner {
      * @param refiningResults native phase 3 (biome verification) is running.
      * @param nativePauseSettled when {@code true}, native pause has taken effect (progress stopped moving for a grace period).
      * @param nativeStopRequested native stop flag is set (search may still be winding down until {@code done}).
+     * @param tiled large-range search split into tiles; the bar then counts completed tiles instead of
+     *     per-phase units, and {@code tileIndex}/{@code tileTotal} describe that block-level progress.
+     * @param tileIndex completed tiles of a tiled search (0 when not tiled).
+     * @param tileTotal total tiles of a tiled search (0 when not tiled).
+     * @param pausePending pause was requested but the native search is still finishing the current tile.
      */
     public record ProgressInfo(int phase, long processed, long total, double percentage, long elapsedMs, long remainingMs,
                                int currentSeedIndex, int totalSeeds, boolean done, boolean refiningResults,
-                               boolean nativePauseSettled, boolean nativeStopRequested) {
+                               boolean nativePauseSettled, boolean nativeStopRequested,
+                               boolean tiled, int tileIndex, int tileTotal, boolean pausePending) {
         public static ProgressInfo of(int phase, long processed, long total, long elapsedMs, long remainingMs) {
             return of(phase, processed, total, elapsedMs, remainingMs, false, false, false);
         }
@@ -111,7 +117,19 @@ public class FlowerFarmFinderSearchRunner {
                                       boolean verifyingResults, boolean nativePauseSettled, boolean nativeStopRequested) {
             double pct = total > 0 ? (processed * 100.0 / total) : 0;
             return new ProgressInfo(phase, processed, total, pct, elapsedMs, remainingMs, 0, 0, false, verifyingResults,
-                nativePauseSettled, nativeStopRequested);
+                nativePauseSettled, nativeStopRequested, false, 0, 0, false);
+        }
+
+        /**
+         * Tiled (large-range) search: the bar counts completed tiles, while the
+         * phase counters describe the tile that is currently running.
+         */
+        public static ProgressInfo tiled(int phase, int tileIndex, int tileTotal, long elapsedMs,
+                                         long remainingMs, boolean pausePending, boolean nativeStopRequested) {
+            int doneTiles = Math.max(0, Math.min(tileIndex, tileTotal));
+            double pct = tileTotal > 0 ? (doneTiles * 100.0 / tileTotal) : 0;
+            return new ProgressInfo(phase, doneTiles, tileTotal, pct, elapsedMs, remainingMs, 0, 0, false,
+                phase == PHASE_VERIFY, false, nativeStopRequested, true, doneTiles, tileTotal, pausePending);
         }
 
         /** Final callback after native search returns. */
@@ -119,7 +137,7 @@ public class FlowerFarmFinderSearchRunner {
             long t = Math.max(1, total);
             long p = Math.min(processed, t);
             double pct = t > 0 ? (p * 100.0 / t) : 100.0;
-            return new ProgressInfo(0, p, t, pct, elapsedMs, 0, 0, 0, true, false, false, false);
+            return new ProgressInfo(0, p, t, pct, elapsedMs, 0, 0, 0, true, false, false, false, false, 0, 0, false);
         }
     }
 
@@ -270,6 +288,8 @@ public class FlowerFarmFinderSearchRunner {
         AtomicLong lastProgressWallMs = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCurSeen = new AtomicLong(Long.MIN_VALUE);
         AtomicInteger lastPhaseSeen = new AtomicInteger(Integer.MIN_VALUE);
+        java.util.concurrent.atomic.AtomicBoolean sawTiled = new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicBoolean stopSeen = new java.util.concurrent.atomic.AtomicBoolean(false);
         ScheduledExecutorService progressScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "flower-farm-progress");
             t.setDaemon(true);
@@ -289,6 +309,18 @@ public class FlowerFarmFinderSearchRunner {
                 int cur = arr[0];
                 int tot = arr[1];
                 int nPhase = arr[2];
+                // Tiled (large-range) searches report block-level progress in
+                // 12..14: the bar counts completed tiles, while the phase
+                // counters describe the tile that is currently running.
+                boolean tiled = arr.length >= 15 && arr[14] > 0;
+                int tileCur = tiled ? Math.max(0, Math.min(arr[13], arr[14])) : 0;
+                int tileTot = tiled ? arr[14] : 0;
+                if (tiled) {
+                    sawTiled.set(true);
+                }
+                if (tryStop) {
+                    stopSeen.set(true);
+                }
                 // Phase 2 (merge/cluster) publishes its own unit counts; use them
                 // so the bar starts at 0 for that phase.  While the counters are
                 // not published yet, keep the previous frame instead of showing
@@ -302,7 +334,7 @@ public class FlowerFarmFinderSearchRunner {
                     }
                 }
                 long elapsed = getElapsedMs();
-                if (tot <= 0) {
+                if (tiled ? tileTot <= 0 : tot <= 0) {
                     return;
                 }
                 long now = System.currentTimeMillis();
@@ -322,17 +354,35 @@ public class FlowerFarmFinderSearchRunner {
                     etaPhaseStartElapsedMs.set(elapsed);
                 }
                 long phaseElapsed = Math.max(0L, elapsed - etaPhaseStartElapsedMs.get());
-                lastProcessed.set(cur);
-                lastTotal.set(tot);
                 long remaining = 0L;
-                if (!isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
-                    double eta = phaseElapsed * ((double) (tot - cur) / (double) cur);
-                    if (eta > 0 && eta < (double) Long.MAX_VALUE) {
-                        remaining = (long) eta;
+                if (tiled) {
+                    // Block-level ETA: average wall time of the completed tiles.
+                    if (tileCur > 0) {
+                        double perTile = elapsed / (double) tileCur;
+                        double eta = (tileTot - tileCur) * perTile;
+                        if (eta > 0 && eta < (double) Long.MAX_VALUE) {
+                            remaining = (long) eta;
+                        }
+                    }
+                    lastProcessed.set(tileCur);
+                    lastTotal.set(tileTot);
+                } else {
+                    lastProcessed.set(cur);
+                    lastTotal.set(tot);
+                    if (!isPaused && tot > cur && cur > 0 && phaseElapsed > 0) {
+                        double eta = phaseElapsed * ((double) (tot - cur) / (double) cur);
+                        if (eta > 0 && eta < (double) Long.MAX_VALUE) {
+                            remaining = (long) eta;
+                        }
                     }
                 }
-                progressCallback.accept(ProgressInfo.of(nPhase, cur, tot, elapsed, remaining,
-                    nPhase == PHASE_VERIFY, pauseSettled, tryStop));
+                // While a tiled search is finishing the current tile, pause is
+                // pending: show that instead of claiming the search is paused.
+                boolean pausePending = tryPause && !pauseSettled;
+                progressCallback.accept(tiled
+                    ? ProgressInfo.tiled(nPhase, tileCur, tileTot, elapsed, remaining, pausePending, tryStop)
+                    : ProgressInfo.of(nPhase, cur, tot, elapsed, remaining,
+                        nPhase == PHASE_VERIFY, pauseSettled, tryStop));
             } catch (Throwable ignored) {
             }
         }, PROGRESS_POLL_MS, PROGRESS_POLL_MS, TimeUnit.MILLISECONDS);
@@ -379,6 +429,11 @@ public class FlowerFarmFinderSearchRunner {
                 long t = lastTotal.get();
                 if (t <= 0) {
                     t = Math.max(p, 1);
+                }
+                // A tiled search that ran to completion ends with every tile
+                // done; the last poll may not have observed the final increment.
+                if (sawTiled.get() && !stopSeen.get()) {
+                    p = t;
                 }
                 progressCallback.accept(ProgressInfo.terminal(getElapsedMs(), p, t));
             }

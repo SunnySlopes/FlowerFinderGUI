@@ -129,11 +129,15 @@ public final class FlowerFarmFinderBridge {
     /**
      * Progress query. Returns
      * {@code [current, total, phase, status, tryPause, tryStop,
-     * phaseCurrent, phaseTotal, overallCurrent, overallTotal]}, or {@code null} if idle.
+     * phaseCurrent, phaseTotal, overallCurrent, overallTotal,
+     * auxCurrent, auxTotal, tiled, tileCurrent, tileTotal]}, or {@code null} if idle.
      * {@code current}/{@code total} describe the current phase.
      * {@code phase}: 0 = preparation, 1 = climate screen, 2 = post-screen merge/cluster tail,
      * 3 = verification. Phase 2 has no meaningful numeric progress.
      * {@code status}: phase 3: 1 = verifying, 2 = verification done; other phases: 1.
+     * {@code tiled}/{@code tileCurrent}/{@code tileTotal} describe a tiled large-range
+     * search: the tile counters are only meaningful when {@code tiled != 0}, and
+     * the phase counters then describe the tile that is currently running.
      */
     public static native int[] getSearchProgress();
 
